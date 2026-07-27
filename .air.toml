@@ -1,0 +1,21 @@
+root = "."
+tmp_dir = "var"
+
+[build]
+cmd = "go build -o ./var/agentd ./cmd/agentd"
+bin = "var/agentd"
+args_bin = ["-config", "agentd.example.json"]
+include_ext = ["go", "html", "css", "js", "json"]
+exclude_dir = [".git", "var"]
+exclude_regex = ["_test\\.go"]
+exclude_unchanged = true
+delay = 150
+stop_on_error = true
+send_interrupt = true
+kill_delay = 500000000
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true

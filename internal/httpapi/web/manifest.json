@@ -1,0 +1,42 @@
+{
+  "name": "agentd",
+  "short_name": "agentd",
+  "description": "Focused mobile work, fleet, and OMP control for agentd",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#090a0c",
+  "theme_color": "#090a0c",
+  "shortcuts": [
+    {
+      "name": "Work",
+      "short_name": "Work",
+      "url": "/"
+    },
+    {
+      "name": "Fleet",
+      "short_name": "Fleet",
+      "url": "/?view=fleet"
+    },
+    {
+      "name": "Settings",
+      "short_name": "Settings",
+      "url": "/?view=settings"
+    }
+  ],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

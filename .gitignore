@@ -1,0 +1,10 @@
+/agentd
+/agentd.local.json
+/agentd.json
+/data/
+*.env
+/var/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
