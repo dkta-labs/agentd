@@ -31,7 +31,7 @@ func (c *fakeHerdrCatalog) Fleet(context.Context) (surface.Fleet, error) {
 	}
 	return surface.Fleet{Surfaces: []surface.Instance{{
 		ID: "default", Provider: "herdr", Label: "Herdr", Status: "working", Workspaces: []surface.Workspace{{
-			ID: "w1", Label: "Gateway", Status: "working", Views: []surface.View{{
+			ID: "w1", Label: "agentd", Status: "working", Views: []surface.View{{
 				ID: "t1", Label: "agents", Status: "working", Targets: []surface.Target{{
 					ID: "p1", Label: "Implement API", Status: "working", Actions: []surface.Action{
 						surface.ActionFocus, surface.ActionRead, surface.ActionSend, surface.ActionClose, surface.ActionLaunchAgent,
@@ -86,7 +86,7 @@ func (c *fakeHerdrCatalog) WorkspaceForTarget(context.Context, string, string) (
 }
 
 func TestSurfaceOperationsHTTPContract(t *testing.T) {
-	baseWorkspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	baseWorkspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	launchWorkspace := config.Workspace{ID: "herdr:dynamic", Name: "Dynamic pane", Path: "/private/dynamic"}
 	catalog := &fakeHerdrCatalog{staticCatalog: staticCatalog{baseWorkspace}, launchWorkspace: launchWorkspace}
 	driver := &recordingDriver{started: make(chan runtime.SessionSpec, 1)}

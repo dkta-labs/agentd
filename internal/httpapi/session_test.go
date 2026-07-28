@@ -146,7 +146,7 @@ func TestSessionStartAndPrompt(t *testing.T) {
 		inputs:  make(chan runtime.Input, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestSessionStartAndPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"gateway"}`))
+	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"agentd"}`))
 	startResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startResponse, startRequest)
 	if startResponse.Code != http.StatusCreated {
@@ -197,7 +197,7 @@ func TestInteractionResponseIsValidatedAndDispatchedOnce(t *testing.T) {
 		interactions: make(chan runtime.InteractionResponse, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -208,7 +208,7 @@ func TestInteractionResponseIsValidatedAndDispatchedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"gateway"}`))
+	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"agentd"}`))
 	startResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startResponse, startRequest)
 	var started sessions.Session
@@ -281,7 +281,7 @@ func TestTimedInteractionExpiresAndUnblocksSession(t *testing.T) {
 		interactions: make(chan runtime.InteractionResponse, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	notifier := make(recordingNotifier, 1)
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil, notifier)
@@ -373,7 +373,7 @@ func TestProcessExitNotificationDistinguishesFailure(t *testing.T) {
 		inputs:  make(chan runtime.Input, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	notifier := make(recordingNotifier, 2)
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, staticCatalog{workspace}, nil, notifier)
 	if err != nil {
@@ -433,7 +433,7 @@ func TestInputIdempotencyKeyDispatchesExactlyOnce(t *testing.T) {
 		inputs:  make(chan runtime.Input, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -444,7 +444,7 @@ func TestInputIdempotencyKeyDispatchesExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"gateway"}`))
+	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"agentd"}`))
 	startResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startResponse, startRequest)
 	if startResponse.Code != http.StatusCreated {
@@ -500,7 +500,7 @@ func TestFailedInputIntentIsDurableAndNotRedispatched(t *testing.T) {
 		sendError: io.ErrClosedPipe,
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -511,7 +511,7 @@ func TestFailedInputIntentIsDurableAndNotRedispatched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"gateway"}`))
+	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"agentd"}`))
 	startResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startResponse, startRequest)
 	var started sessions.Session
@@ -565,7 +565,7 @@ func TestSessionReplayRestoresUserAndAssistantExactlyOnce(t *testing.T) {
 		inputs:  make(chan runtime.Input, 1),
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -577,7 +577,7 @@ func TestSessionReplayRestoresUserAndAssistantExactlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"gateway"}`))
+	startRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"workspaceId":"agentd"}`))
 	startResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startResponse, startRequest)
 	if startResponse.Code != http.StatusCreated {
@@ -664,7 +664,7 @@ func TestManagerCloseStopsSessionsConcurrently(t *testing.T) {
 		},
 	}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, staticCatalog{workspace}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -704,7 +704,7 @@ func TestParentCancellationCannotRacePlannedSessionShutdown(t *testing.T) {
 		exited:         make(chan struct{}),
 	}
 	notifier := make(recordingNotifier, 1)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	manager, err := sessions.NewManager(parent, testHarnessRegistry(t, driver), events.NewBroker(nil), nil, staticCatalog{workspace}, nil, notifier)
 	if err != nil {
 		t.Fatal(err)

@@ -24,7 +24,7 @@ func TestEventReplaySurvivesReopen(t *testing.T) {
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
 		ID:            "ses_test",
-		WorkspaceID:   "gateway",
+		WorkspaceID:   "agentd",
 		WorkspacePath: "/private/repo",
 		State:         "running",
 		CreatedAt:     now,
@@ -77,7 +77,7 @@ func TestEventSourceIDPreventsRetryDuplication(t *testing.T) {
 	defer database.Close()
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
-		ID: "ses_dedupe", WorkspaceID: "gateway", WorkspacePath: "/private/repo",
+		ID: "ses_dedupe", WorkspaceID: "agentd", WorkspacePath: "/private/repo",
 		HarnessID: "omp", State: "running", CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestReopenNormalizesLegacyEventTypes(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
-		ID: "ses_legacy", WorkspaceID: "gateway", WorkspacePath: "/private/repo",
+		ID: "ses_legacy", WorkspaceID: "agentd", WorkspacePath: "/private/repo",
 		HarnessID: "omp", State: "idle", CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestInputReservationIsIdempotentAcrossReopen(t *testing.T) {
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
 		ID:            "ses_input",
-		WorkspaceID:   "gateway",
+		WorkspaceID:   "agentd",
 		WorkspacePath: "/private/repo",
 		State:         "running",
 		CreatedAt:     now,
@@ -220,7 +220,7 @@ func TestPendingInputIsNotRedispatchedAfterReopen(t *testing.T) {
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
 		ID:            "ses_pending",
-		WorkspaceID:   "gateway",
+		WorkspaceID:   "agentd",
 		WorkspacePath: "/private/repo",
 		State:         "running",
 		CreatedAt:     now,
@@ -338,7 +338,7 @@ func TestEnrollmentTokenLookupDoesNotInterruptLiveSession(t *testing.T) {
 	now := time.Now().UTC()
 	if err := database.CreateSession(ctx, SessionRecord{
 		ID:            "ses_live",
-		WorkspaceID:   "gateway",
+		WorkspaceID:   "agentd",
 		WorkspacePath: "/private/repo",
 		State:         "running",
 		CreatedAt:     now,

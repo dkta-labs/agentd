@@ -24,7 +24,7 @@ func (acceptingPushSender) Send(context.Context, []byte, devices.PushSubscriptio
 
 func TestHealthAndWorkspaceEndpoints(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	catalog := staticCatalog{{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}}
+	catalog := staticCatalog{{ID: "agentd", Name: "agentd", Path: "/private/repo"}}
 	server, err := New(catalog, logger, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func TestHealthAndWorkspaceEndpoints(t *testing.T) {
 		if err := json.Unmarshal(rawBody, &body); err != nil {
 			t.Fatal(err)
 		}
-		if len(body) != 1 || body[0]["id"] != "gateway" {
+		if len(body) != 1 || body[0]["id"] != "agentd" {
 			t.Fatalf("unexpected body: %#v", body)
 		}
 		if strings.Contains(string(rawBody), "/private/repo") {

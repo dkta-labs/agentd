@@ -348,7 +348,7 @@ func Tools() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "agentd_list_workspaces",
-			"description": "List the Herdr-backed workspaces available to the local agent gateway.",
+			"description": "List the Herdr-backed workspaces available to the local agentd controller.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
 		},
 		{
