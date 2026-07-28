@@ -146,7 +146,7 @@ hermes mcp test agentd
 hermes gateway restart
 ```
 
-The MCP surface provides surface-backed workspace discovery, synchronous OMP delegation, session follow-ups, durable normalized event reads, and abort control. It does not replace Hermes' conversation or memory model.
+The MCP surface provides surface-backed workspace discovery, synchronous OMP delegation, session follow-ups, durable normalized event reads, bounded supervised-loop creation/control, and abort control. It does not replace Hermes' conversation or memory model.
 
 ## Dogfood
 
@@ -155,6 +155,8 @@ The Android PWA installs from Chrome and caches its shell for offline startup. I
 Agent launch choices come from `GET /api/v1/capabilities`; the UI sends the selected `harnessId` rather than assuming OMP. Each surface target advertises `presentations` and a `preferredPresentation`, and **Work** opens that preferred mode instead of treating every target as terminal output. Agentd-managed OMP targets prefer `conversation`, which opens the durable native transcript, interactions, composer, and abort control; their explicit `screen` choice retains the Herdr snapshot as a degraded output view rather than claiming exact PTY semantics. Targets without an attached managed session are labeled as screen output and offer **Start conversation** when agent launch is available. An OMP process launched from a Herdr target still runs under `agentd` supervision, and its Herdr tab remains a status attachment. Closing a managed attachment closes the supervised harness session and surface target together.
 
 Sessions, user input intents, interaction responses, and normalized harness events are committed to SQLite before broadcast. Public event kinds include `input_submitted`, `assistant_delta`, `interaction_requested`, `tool_started`, `turn_completed`, and `session_exited`; adapter-only events are wrapped as `adapter_event`. EventSource reconnects honor the greater of the URL cursor and `Last-Event-ID`; a full browser reload reconstructs the transcript exactly once. Push preferences are stored per device, expired browser subscriptions are pruned, and notifications carry opaque surface/target/session IDs rather than terminal titles or output.
+
+Supervised loops are generic records over an allowlisted Herdr workspace, harness, bounded prompt, cadence, and timeout. Creating a loop leaves it paused. A manual `run` or explicit recurring `start` claims one durable run row before starting one fresh agentd-managed session; the run stores its session ID, idempotency key, event cursor, state, and error. Herdr displays the active OMP attachment, while the session event log remains the evidence authority. Successful recurring iterations schedule from completion time. Failure, timeout, or daemon interruption pauses the loop and requires an explicit restart; the supervisor never answers OMP interactions or infers approval for deploys, merges, pushes, publication, payments, secrets, or other external side effects.
 
 Static PWA assets, health, auth status, and enrollment are public. Every surface operation, workspace, session, device-management, and MCP route requires a device credential when authentication is enabled.
 
@@ -172,6 +174,14 @@ PUT    /api/v1/device/push
 DELETE /api/v1/device/push
 GET    /api/v1/capabilities
 GET    /api/v1/workspaces
+GET    /api/v1/loops
+POST   /api/v1/loops
+GET    /api/v1/loops/{id}
+PUT    /api/v1/loops/{id}
+GET    /api/v1/loops/{id}/runs
+POST   /api/v1/loops/{id}/start
+POST   /api/v1/loops/{id}/pause
+POST   /api/v1/loops/{id}/run
 GET    /api/v1/surfaces
 GET    /api/v1/surfaces/{surfaceID}/targets/{targetID}/output
 GET    /api/v1/surfaces/{surfaceID}/targets/{targetID}/events
@@ -200,4 +210,4 @@ go test ./...
 
 ## Known boundary
 
-Durable transcripts survive `agentd` restarts, but OMP RPC processes started by the old daemon cannot currently be reattached. Those sessions become `interrupted`; the Android PWA keeps their transcript readable and disables input rather than pretending the runtime is live.
+Durable transcripts and loop/run records survive `agentd` restarts, but OMP RPC processes started by the old daemon cannot currently be reattached. Those sessions become `interrupted`; active loops also become `interrupted` and paused rather than spawning a replacement automatically. The Android PWA keeps interrupted transcripts readable and disables input rather than pretending the runtime is live.

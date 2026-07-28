@@ -12,8 +12,10 @@ import (
 
 	"github.com/dkta-labs/agentd/internal/config"
 	"github.com/dkta-labs/agentd/internal/events"
+	"github.com/dkta-labs/agentd/internal/loops"
 	"github.com/dkta-labs/agentd/internal/runtime"
 	"github.com/dkta-labs/agentd/internal/sessions"
+	"github.com/dkta-labs/agentd/internal/store"
 )
 
 const protocolVersion = "2025-11-25"
@@ -22,10 +24,22 @@ type WorkspaceCatalog interface {
 	List(context.Context) []config.Workspace
 }
 
+type LoopAPI interface {
+	Create(context.Context, loops.CreateRequest) (store.LoopRecord, error)
+	Update(context.Context, string, loops.CreateRequest) (store.LoopRecord, error)
+	List(context.Context) ([]store.LoopRecord, error)
+	Get(context.Context, string) (store.LoopRecord, error)
+	Runs(context.Context, string, int) ([]store.LoopRunRecord, error)
+	ResumeLoop(context.Context, string) (store.LoopRecord, error)
+	PauseLoop(context.Context, string) (store.LoopRecord, error)
+	RunLoop(context.Context, string) (store.LoopRecord, error)
+}
+
 type Server struct {
-	catalog  WorkspaceCatalog
-	sessions *sessions.Manager
-	broker   *events.Broker
+	catalog     WorkspaceCatalog
+	sessions    *sessions.Manager
+	broker      *events.Broker
+	loopManager LoopAPI
 }
 
 type request struct {
@@ -58,7 +72,11 @@ type toolContent struct {
 }
 
 func New(catalog WorkspaceCatalog, sessionManager *sessions.Manager, broker *events.Broker) *Server {
-	return &Server{catalog: catalog, sessions: sessionManager, broker: broker}
+	return NewWithLoops(catalog, sessionManager, broker, nil)
+}
+
+func NewWithLoops(catalog WorkspaceCatalog, sessionManager *sessions.Manager, broker *events.Broker, loopManager LoopAPI) *Server {
+	return &Server{catalog: catalog, sessions: sessionManager, broker: broker, loopManager: loopManager}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +130,7 @@ func (s *Server) handle(ctx context.Context, incoming request) (any, *rpcError) 
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
-		return map[string]any{"tools": Tools()}, nil
+		return map[string]any{"tools": s.tools()}, nil
 	case "tools/call":
 		var params struct {
 			Name      string          `json:"name"`
@@ -201,6 +219,74 @@ func (s *Server) callTool(ctx context.Context, name string, arguments json.RawMe
 		if err = decodeArguments(arguments, &input); err == nil {
 			err = s.sessions.Abort(ctx, input.SessionID)
 			value = map[string]any{"sessionId": input.SessionID, "aborted": err == nil}
+		}
+	case "agentd_list_loops":
+		if s.loopManager == nil {
+			err = errors.New("loop supervisor is unavailable")
+			break
+		}
+		value, err = s.loopManager.List(ctx)
+	case "agentd_create_loop":
+		if s.loopManager == nil {
+			err = errors.New("loop supervisor is unavailable")
+			break
+		}
+		var input loops.CreateRequest
+		if err = decodeArguments(arguments, &input); err == nil {
+			value, err = s.loopManager.Create(ctx, input)
+		}
+	case "agentd_update_loop":
+		if s.loopManager == nil {
+			err = errors.New("loop supervisor is unavailable")
+			break
+		}
+		var input struct {
+			LoopID string `json:"loopId"`
+			loops.CreateRequest
+		}
+		if err = decodeArguments(arguments, &input); err == nil {
+			value, err = s.loopManager.Update(ctx, input.LoopID, input.CreateRequest)
+		}
+	case "agentd_get_loop":
+		if s.loopManager == nil {
+			err = errors.New("loop supervisor is unavailable")
+			break
+		}
+		var input struct {
+			LoopID   string `json:"loopId"`
+			RunLimit int    `json:"runLimit"`
+		}
+		if err = decodeArguments(arguments, &input); err == nil {
+			var loop store.LoopRecord
+			loop, err = s.loopManager.Get(ctx, input.LoopID)
+			if err == nil {
+				var runs []store.LoopRunRecord
+				runs, err = s.loopManager.Runs(ctx, input.LoopID, input.RunLimit)
+				if err == nil {
+					value = map[string]any{"loop": loop, "runs": runs}
+				}
+			}
+		}
+	case "agentd_control_loop":
+		if s.loopManager == nil {
+			err = errors.New("loop supervisor is unavailable")
+			break
+		}
+		var input struct {
+			LoopID string `json:"loopId"`
+			Action string `json:"action"`
+		}
+		if err = decodeArguments(arguments, &input); err == nil {
+			switch input.Action {
+			case "start":
+				value, err = s.loopManager.ResumeLoop(ctx, input.LoopID)
+			case "pause":
+				value, err = s.loopManager.PauseLoop(ctx, input.LoopID)
+			case "run":
+				value, err = s.loopManager.RunLoop(ctx, input.LoopID)
+			default:
+				err = errors.New("action must be start, pause, or run")
+			}
 		}
 	default:
 		err = fmt.Errorf("unknown tool %q", name)
@@ -344,8 +430,40 @@ func writeResponse(w http.ResponseWriter, value response) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func loopDefinitionSchema(requireID bool) map[string]any {
+	properties := map[string]any{
+		"name":           map[string]any{"type": "string", "minLength": 1, "maxLength": 120},
+		"workspaceId":    map[string]any{"type": "string"},
+		"harnessId":      map[string]any{"type": "string"},
+		"prompt":         map[string]any{"type": "string", "minLength": 1, "maxLength": 65536},
+		"cadenceSeconds": map[string]any{"type": "integer", "minimum": 0, "maximum": 2592000},
+		"timeoutSeconds": map[string]any{"type": "integer", "minimum": 30, "maximum": 1800},
+	}
+	required := []string{"name", "workspaceId", "prompt", "cadenceSeconds"}
+	if requireID {
+		properties["loopId"] = map[string]any{"type": "string"}
+		required = append(required, "loopId")
+	}
+	return map[string]any{
+		"type": "object", "properties": properties,
+		"required": required, "additionalProperties": false,
+	}
+}
+
 func Tools() []map[string]any {
-	return []map[string]any{
+	return tools(false)
+}
+
+func ToolsWithLoops() []map[string]any {
+	return tools(true)
+}
+
+func (s *Server) tools() []map[string]any {
+	return tools(s.loopManager != nil)
+}
+
+func tools(includeLoops bool) []map[string]any {
+	result := []map[string]any{
 		{
 			"name":        "agentd_list_workspaces",
 			"description": "List the Herdr-backed workspaces available to the local agent gateway.",
@@ -412,4 +530,48 @@ func Tools() []map[string]any {
 			},
 		},
 	}
+	if !includeLoops {
+		return result
+	}
+	return append(result, []map[string]any{
+		{
+			"name":        "agentd_list_loops",
+			"description": "List durable supervised loops, their desired and observed states, schedules, active agentd session IDs, and last errors.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
+		},
+		{
+			"name":        "agentd_create_loop",
+			"description": "Create a paused durable loop for one allowlisted Herdr workspace. cadenceSeconds 0 creates a manual-only loop; recurring loops must be explicitly started.",
+			"inputSchema": loopDefinitionSchema(false),
+		},
+		{
+			"name":        "agentd_update_loop",
+			"description": "Replace the definition of a loop that has no active run.",
+			"inputSchema": loopDefinitionSchema(true),
+		},
+		{
+			"name":        "agentd_get_loop",
+			"description": "Read one durable loop and its recent runs. Session events remain the authoritative transcript and evidence.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"loopId":   map[string]any{"type": "string"},
+					"runLimit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
+				},
+				"required": []string{"loopId"}, "additionalProperties": false,
+			},
+		},
+		{
+			"name":        "agentd_control_loop",
+			"description": "Start a recurring loop, pause future iterations, or request one immediate bounded run. This never answers OMP interactions or approves high-impact actions.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"loopId": map[string]any{"type": "string"},
+					"action": map[string]any{"type": "string", "enum": []string{"start", "pause", "run"}},
+				},
+				"required": []string{"loopId", "action"}, "additionalProperties": false,
+			},
+		},
+	}...)
 }

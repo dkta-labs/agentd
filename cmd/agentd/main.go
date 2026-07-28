@@ -20,6 +20,7 @@ import (
 	"github.com/dkta-labs/agentd/internal/fleet"
 	"github.com/dkta-labs/agentd/internal/herdr"
 	"github.com/dkta-labs/agentd/internal/httpapi"
+	"github.com/dkta-labs/agentd/internal/loops"
 	"github.com/dkta-labs/agentd/internal/mcp"
 	"github.com/dkta-labs/agentd/internal/omp"
 	"github.com/dkta-labs/agentd/internal/runtime"
@@ -149,8 +150,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	mcpServer := mcp.New(catalog, sessionManager, broker)
-	app, err := httpapi.NewWithFleet(catalog, logger, sessionManager, broker, mcpServer, fleetService, deviceService)
+	loopSupervisor, err := loops.New(database, catalog, sessionManager, broker, logger)
+	if err != nil {
+		return err
+	}
+	loopSupervisor.Start(ctx)
+	mcpServer := mcp.NewWithLoops(catalog, sessionManager, broker, loopSupervisor)
+	app, err := httpapi.NewWithFleetAndLoops(catalog, logger, sessionManager, broker, mcpServer, fleetService, loopSupervisor, deviceService)
 	if err != nil {
 		return err
 	}
@@ -171,6 +177,9 @@ func run() error {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if err := loopSupervisor.Close(shutdownCtx); err != nil {
+			logger.Error("loop supervisor shutdown failed", "error", err)
+		}
 		if err := sessionManager.Close(shutdownCtx); err != nil {
 			logger.Error("session shutdown failed", "error", err)
 		}

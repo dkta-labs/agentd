@@ -98,10 +98,14 @@ func Open(ctx context.Context, dataDir string) (*DB, error) {
 	if _, err := database.ExecContext(ctx, `
 		UPDATE sessions
 		SET state = 'interrupted', updated_at = ?
-		WHERE state IN ('starting', 'running', 'idle')
+		WHERE state IN ('starting', 'running', 'idle', 'blocked')
 	`, encodeTime(time.Now().UTC())); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("mark stale sessions interrupted: %w", err)
+	}
+	if err := store.recoverActiveLoops(ctx, time.Now().UTC()); err != nil {
+		_ = database.Close()
+		return nil, err
 	}
 	return store, nil
 }
@@ -149,6 +153,41 @@ func (s *DB) migrate(ctx context.Context) error {
 			UNIQUE (session_id, input_id),
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
+		CREATE TABLE IF NOT EXISTS loops (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
+			harness_id TEXT NOT NULL DEFAULT 'omp',
+			prompt TEXT NOT NULL,
+			cadence_seconds INTEGER NOT NULL,
+			timeout_seconds INTEGER NOT NULL,
+			desired_state TEXT NOT NULL,
+			state TEXT NOT NULL,
+			iteration INTEGER NOT NULL DEFAULT 0,
+			run_requested INTEGER NOT NULL DEFAULT 0,
+			active_run_id TEXT NOT NULL DEFAULT '',
+			active_session_id TEXT NOT NULL DEFAULT '',
+			last_event_sequence INTEGER NOT NULL DEFAULT 0,
+			next_run_at TEXT,
+			last_run_at TEXT,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS loop_runs (
+			id TEXT PRIMARY KEY,
+			loop_id TEXT NOT NULL,
+			iteration INTEGER NOT NULL,
+			session_id TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL,
+			state TEXT NOT NULL,
+			last_event_sequence INTEGER NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			UNIQUE (loop_id, iteration),
+			FOREIGN KEY (loop_id) REFERENCES loops(id) ON DELETE CASCADE
+		);
 		CREATE TABLE IF NOT EXISTS devices (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -181,6 +220,10 @@ func (s *DB) migrate(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS events_session_sequence
 		ON events(session_id, sequence);
+		CREATE INDEX IF NOT EXISTS loops_schedule
+		ON loops(state, run_requested, next_run_at);
+		CREATE INDEX IF NOT EXISTS loop_runs_loop_iteration
+		ON loop_runs(loop_id, iteration DESC);
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate SQLite: %w", err)

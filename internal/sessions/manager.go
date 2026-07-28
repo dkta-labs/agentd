@@ -19,8 +19,9 @@ import (
 )
 
 var (
-	ErrNotFound   = errors.New("session not found")
-	ErrNotRunning = errors.New("session runtime is not running")
+	ErrNotFound      = errors.New("session not found")
+	ErrNotRunning    = errors.New("session runtime is not running")
+	ErrAlreadyExists = errors.New("session already exists")
 )
 
 type Session struct {
@@ -137,7 +138,19 @@ func (m *Manager) StartWithHarness(ctx context.Context, workspaceID, harnessID s
 	if err != nil {
 		return Session{}, err
 	}
-	return m.StartWorkspaceWithHarness(ctx, workspace, harnessID)
+	id, err := newID()
+	if err != nil {
+		return Session{}, err
+	}
+	return m.startWorkspaceWithHarnessAndID(ctx, m.ctx, workspace, harnessID, id)
+}
+
+func (m *Manager) StartWithHarnessAndID(ctx context.Context, workspaceID, harnessID, id string) (Session, error) {
+	workspace, err := m.workspaces.Resolve(ctx, workspaceID)
+	if err != nil {
+		return Session{}, err
+	}
+	return m.startWorkspaceWithHarnessAndID(ctx, ctx, workspace, harnessID, id)
 }
 
 func (m *Manager) StartWorkspace(ctx context.Context, workspace config.Workspace) (Session, error) {
@@ -145,19 +158,37 @@ func (m *Manager) StartWorkspace(ctx context.Context, workspace config.Workspace
 }
 
 func (m *Manager) StartWorkspaceWithHarness(ctx context.Context, workspace config.Workspace, harnessID string) (Session, error) {
+	id, err := newID()
+	if err != nil {
+		return Session{}, err
+	}
+	return m.startWorkspaceWithHarnessAndID(ctx, m.ctx, workspace, harnessID, id)
+}
+
+func (m *Manager) StartWorkspaceWithHarnessAndID(ctx context.Context, workspace config.Workspace, harnessID, id string) (Session, error) {
+	return m.startWorkspaceWithHarnessAndID(ctx, ctx, workspace, harnessID, id)
+}
+
+func (m *Manager) startWorkspaceWithHarnessAndID(ctx, runtimeCtx context.Context, workspace config.Workspace, harnessID, id string) (Session, error) {
 	if workspace.ID == "" || workspace.Path == "" {
 		return Session{}, errors.New("workspace ID and path are required")
+	}
+	if id == "" {
+		return Session{}, errors.New("session ID is required")
 	}
 	registration, err := m.harnesses.Resolve(harnessID)
 	if err != nil {
 		return Session{}, err
 	}
-	id, err := newID()
-	if err != nil {
-		return Session{}, err
-	}
 	now := time.Now().UTC()
 	metadata := Session{ID: id, WorkspaceID: workspace.ID, HarnessID: registration.Descriptor.ID, State: "starting", CreatedAt: now, UpdatedAt: now}
+	m.mu.Lock()
+	if _, exists := m.sessions[id]; exists {
+		m.mu.Unlock()
+		return Session{}, ErrAlreadyExists
+	}
+	m.sessions[id] = &managedSession{metadata: metadata, normalize: registration.Normalize}
+	m.mu.Unlock()
 	if m.persistence != nil {
 		if err := m.persistence.CreateSession(m.ctx, store.SessionRecord{
 			ID:            id,
@@ -168,14 +199,14 @@ func (m *Manager) StartWorkspaceWithHarness(ctx context.Context, workspace confi
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		}); err != nil {
+			m.mu.Lock()
+			delete(m.sessions, id)
+			m.mu.Unlock()
 			return Session{}, err
 		}
 	}
-	m.mu.Lock()
-	m.sessions[id] = &managedSession{metadata: metadata, normalize: registration.Normalize}
-	m.mu.Unlock()
 
-	running, err := registration.Driver.Start(m.ctx, runtime.SessionSpec{
+	running, err := registration.Driver.Start(runtimeCtx, runtime.SessionSpec{
 		ID:            id,
 		WorkspaceID:   workspace.ID,
 		WorkspacePath: workspace.Path,
@@ -747,7 +778,7 @@ func (m *Manager) Stop(ctx context.Context, sessionID string) error {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	if session != nil {
-		delete(m.sessions, sessionID)
+		session.closing = true
 	}
 	m.mu.Unlock()
 	if session == nil {
@@ -768,6 +799,11 @@ func (m *Manager) Stop(ctx context.Context, sessionID string) error {
 	for range cleanups {
 		joined = errors.Join(joined, <-results)
 	}
+	m.mu.Lock()
+	if retained := m.sessions[sessionID]; retained == session {
+		retained.runtime = nil
+	}
+	m.mu.Unlock()
 	return joined
 }
 
@@ -932,7 +968,9 @@ func (s sessionSink) Publish(ctx context.Context, event runtime.Event) error {
 			}
 			s.manager.notifier.Notify(s.sessionID, "failed", harnessName+" session failed", message)
 		}
-		if !expectedExit {
+		if expectedExit {
+			_ = s.manager.setState(ctx, s.sessionID, "stopped")
+		} else {
 			_ = s.manager.setState(ctx, s.sessionID, "exited")
 			if s.manager.attachments != nil {
 				_ = s.manager.attachments.Detach(ctx, s.sessionID)

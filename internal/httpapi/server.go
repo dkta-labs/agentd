@@ -18,6 +18,7 @@ import (
 	"github.com/dkta-labs/agentd/internal/config"
 	"github.com/dkta-labs/agentd/internal/devices"
 	"github.com/dkta-labs/agentd/internal/events"
+	"github.com/dkta-labs/agentd/internal/loops"
 	"github.com/dkta-labs/agentd/internal/mcp"
 	"github.com/dkta-labs/agentd/internal/runtime"
 	"github.com/dkta-labs/agentd/internal/sessions"
@@ -45,6 +46,17 @@ type FleetAPI interface {
 	Register(*http.ServeMux)
 }
 
+type LoopAPI interface {
+	Create(context.Context, loops.CreateRequest) (store.LoopRecord, error)
+	Update(context.Context, string, loops.CreateRequest) (store.LoopRecord, error)
+	List(context.Context) ([]store.LoopRecord, error)
+	Get(context.Context, string) (store.LoopRecord, error)
+	Runs(context.Context, string, int) ([]store.LoopRunRecord, error)
+	ResumeLoop(context.Context, string) (store.LoopRecord, error)
+	PauseLoop(context.Context, string) (store.LoopRecord, error)
+	RunLoop(context.Context, string) (store.LoopRecord, error)
+}
+
 type Server struct {
 	handler http.Handler
 }
@@ -57,7 +69,7 @@ func New(
 	mcpHandler http.Handler,
 	deviceServices ...*devices.Service,
 ) (*Server, error) {
-	return NewWithFleet(catalog, logger, sessionManager, broker, mcpHandler, nil, deviceServices...)
+	return NewWithFleetAndLoops(catalog, logger, sessionManager, broker, mcpHandler, nil, nil, deviceServices...)
 }
 
 func NewWithFleet(
@@ -67,6 +79,19 @@ func NewWithFleet(
 	broker *events.Broker,
 	mcpHandler http.Handler,
 	fleetAPI FleetAPI,
+	deviceServices ...*devices.Service,
+) (*Server, error) {
+	return NewWithFleetAndLoops(catalog, logger, sessionManager, broker, mcpHandler, fleetAPI, nil, deviceServices...)
+}
+
+func NewWithFleetAndLoops(
+	catalog WorkspaceCatalog,
+	logger *slog.Logger,
+	sessionManager *sessions.Manager,
+	broker *events.Broker,
+	mcpHandler http.Handler,
+	fleetAPI FleetAPI,
+	loopAPI LoopAPI,
 	deviceServices ...*devices.Service,
 ) (*Server, error) {
 	assets, err := fs.Sub(webFiles, "web")
@@ -216,9 +241,13 @@ func NewWithFleet(
 		if sessionManager != nil {
 			harnesses = sessionManager.Harnesses()
 		}
+		tools := mcp.Tools()
+		if loopAPI != nil {
+			tools = mcp.ToolsWithLoops()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"harnesses": harnesses,
-			"tools":     mcp.Tools(),
+			"tools":     tools,
 		})
 	})
 	mux.HandleFunc("GET /api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
@@ -232,6 +261,117 @@ func NewWithFleet(
 			workspaces = append(workspaces, workspaceResponse{ID: workspace.ID, Name: workspace.Name})
 		}
 		writeJSON(w, http.StatusOK, workspaces)
+	})
+	mux.HandleFunc("GET /api/v1/loops", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		available, err := loopAPI.List(r.Context())
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, available)
+	})
+	mux.HandleFunc("POST /api/v1/loops", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		var request loops.CreateRequest
+		if err := decodeJSON(r.Body, &request); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		created, err := loopAPI.Create(r.Context(), request)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	})
+	mux.HandleFunc("GET /api/v1/loops/{loopID}", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		record, err := loopAPI.Get(r.Context(), r.PathValue("loopID"))
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
+	})
+	mux.HandleFunc("PUT /api/v1/loops/{loopID}", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		var request loops.CreateRequest
+		if err := decodeJSON(r.Body, &request); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		updated, err := loopAPI.Update(r.Context(), r.PathValue("loopID"), request)
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+	})
+	mux.HandleFunc("GET /api/v1/loops/{loopID}/runs", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil && r.URL.Query().Get("limit") != "" {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be an integer"))
+			return
+		}
+		runs, err := loopAPI.Runs(r.Context(), r.PathValue("loopID"), limit)
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, runs)
+	})
+	mux.HandleFunc("POST /api/v1/loops/{loopID}/start", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		record, err := loopAPI.ResumeLoop(r.Context(), r.PathValue("loopID"))
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, record)
+	})
+	mux.HandleFunc("POST /api/v1/loops/{loopID}/pause", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		record, err := loopAPI.PauseLoop(r.Context(), r.PathValue("loopID"))
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, record)
+	})
+	mux.HandleFunc("POST /api/v1/loops/{loopID}/run", func(w http.ResponseWriter, r *http.Request) {
+		if loopAPI == nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("loop supervisor is unavailable"))
+			return
+		}
+		record, err := loopAPI.RunLoop(r.Context(), r.PathValue("loopID"))
+		if err != nil {
+			writeLoopError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, record)
 	})
 	mux.HandleFunc("GET /api/v1/surfaces", func(w http.ResponseWriter, r *http.Request) {
 		if surfaceOperations == nil {
@@ -615,6 +755,19 @@ func writeSurfaceUpstreamError(w http.ResponseWriter, logger *slog.Logger, opera
 		logger.Error("surface operation failed", "operation", operation, "error", err)
 	}
 	writeError(w, http.StatusBadGateway, errors.New("surface operation failed"))
+}
+
+func writeLoopError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, store.ErrLoopActive),
+		errors.Is(err, store.ErrLoopManual),
+		errors.Is(err, store.ErrLoopRunRequested):
+		writeError(w, http.StatusConflict, err)
+	default:
+		writeError(w, http.StatusBadRequest, err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
