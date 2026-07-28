@@ -55,7 +55,7 @@ func (s exitOnCloseSession) Close(ctx context.Context) error {
 
 func TestExplicitSessionIDRuntimeHonorsCallerDeadline(t *testing.T) {
 	driver := blockingStartDriver{cancelled: make(chan struct{})}
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), events.NewBroker(nil), nil, staticCatalog{workspace}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestExplicitSessionIDRuntimeHonorsCallerDeadline(t *testing.T) {
 
 func TestExplicitSessionIDIsReservedBeforeRuntimeStart(t *testing.T) {
 	driver := &recordingDriver{started: make(chan runtime.SessionSpec, 1)}
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), events.NewBroker(nil), nil, staticCatalog{workspace}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestExplicitSessionIDIsReservedBeforeRuntimeStart(t *testing.T) {
 func TestStoppedSessionRemainsReadableForDurableLoopEvidence(t *testing.T) {
 	driver := &recordingDriver{started: make(chan runtime.SessionSpec, 1)}
 	broker := events.NewBroker(nil)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	catalog := staticCatalog{workspace}
 	manager, err := sessions.NewManager(context.Background(), testHarnessRegistry(t, driver), broker, nil, catalog, nil)
 	if err != nil {
@@ -137,7 +137,7 @@ func TestPlannedProcessExitPersistsStoppedStateAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	broker := events.NewBroker(database)
-	workspace := config.Workspace{ID: "gateway", Name: "Agent Gateway", Path: "/private/repo"}
+	workspace := config.Workspace{ID: "agentd", Name: "agentd", Path: "/private/repo"}
 	manager, err := sessions.NewManager(ctx, testHarnessRegistry(t, exitOnCloseDriver{}), broker, database, staticCatalog{workspace}, nil)
 	if err != nil {
 		t.Fatal(err)
