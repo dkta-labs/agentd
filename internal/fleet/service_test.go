@@ -41,7 +41,7 @@ func TestWorkerExecutesRemoteSessionAndReconnectsWithoutDuplicate(t *testing.T) 
 		Token:         enrollment.Token,
 		NodeID:        enrollment.Node.ID,
 		Name:          enrollment.Node.Name,
-		Workspaces:    []config.Workspace{{ID: "gateway", Name: "Gateway", Path: t.TempDir()}},
+		Workspaces:    []config.Workspace{{ID: "agentd", Name: "agentd", Path: t.TempDir()}},
 		Driver:        local,
 		Logger:        testLogger(),
 		HTTPClient:    server.Client(),
@@ -60,7 +60,7 @@ func TestWorkerExecutesRemoteSessionAndReconnectsWithoutDuplicate(t *testing.T) 
 	sink := &recordingSink{}
 	distributed := Driver{Service: service}
 	startCtx, startCancel := context.WithTimeout(ctx, 5*time.Second)
-	remote, err := distributed.Start(startCtx, runtime.SessionSpec{ID: "session-1", WorkspaceID: "gateway"}, sink)
+	remote, err := distributed.Start(startCtx, runtime.SessionSpec{ID: "session-1", WorkspaceID: "agentd"}, sink)
 	startCancel()
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func TestWorkerExecutesRemoteSessionAndReconnectsWithoutDuplicate(t *testing.T) 
 		Token:         enrollment.Token,
 		NodeID:        enrollment.Node.ID,
 		Name:          enrollment.Node.Name,
-		Workspaces:    []config.Workspace{{ID: "gateway", Name: "Gateway", Path: t.TempDir()}},
+		Workspaces:    []config.Workspace{{ID: "agentd", Name: "agentd", Path: t.TempDir()}},
 		Driver:        restartedDriver,
 		Logger:        testLogger(),
 		HTTPClient:    server.Client(),
@@ -158,14 +158,14 @@ func TestWorkerCommandReplayIsIdempotent(t *testing.T) {
 		ControllerURL: "http://127.0.0.1",
 		Token:         "token",
 		NodeID:        "node",
-		Workspaces:    []config.Workspace{{ID: "gateway", Path: t.TempDir()}},
+		Workspaces:    []config.Workspace{{ID: "agentd", Path: t.TempDir()}},
 		Driver:        local,
 		Logger:        testLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, _ := json.Marshal(StartPayload{WorkspaceID: "gateway", HarnessID: "omp"})
+	payload, _ := json.Marshal(StartPayload{WorkspaceID: "agentd", HarnessID: "omp"})
 	command := Command{ID: "command-1", Type: "start", SessionID: "session-1", Payload: payload}
 	first := worker.executeCommand(context.Background(), command)
 	second := worker.executeCommand(context.Background(), command)

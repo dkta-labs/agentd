@@ -13,7 +13,7 @@ func TestLoadNormalizesConfiguredPaths(t *testing.T) {
 	content := `{
 		"listen": "127.0.0.1:9000",
 		"dataDir": "state",
-		"workspaces": [{"id": "gateway", "name": "", "path": "repo"}]
+		"workspaces": [{"id": "agentd", "name": "", "path": "repo"}]
 	}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestLoadNormalizesConfiguredPaths(t *testing.T) {
 	if got, want := cfg.Workspaces[0].Path, filepath.Join(dir, "repo"); got != want {
 		t.Fatalf("workspace path = %q, want %q", got, want)
 	}
-	if got, want := cfg.Workspaces[0].Name, "gateway"; got != want {
+	if got, want := cfg.Workspaces[0].Name, "agentd"; got != want {
 		t.Fatalf("workspace name = %q, want %q", got, want)
 	}
 }

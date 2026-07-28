@@ -46,7 +46,7 @@ self.addEventListener("push", event => {
     body: payload.body || "An agent has an update.",
     icon: "/icon-192.png",
     badge: "/badge-96.png",
-    tag: `agentd-${payload.sessionId || "gateway"}-${payload.category || "update"}`,
+    tag: `agentd-${payload.sessionId || "unknown"}-${payload.category || "update"}`,
     data: { url: payload.url || "/" },
   }));
 });

@@ -8,3 +8,6 @@
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
+/apps/ui-lab/node_modules/
+/apps/ui-lab/.expo/
+/apps/ui-lab/dist/

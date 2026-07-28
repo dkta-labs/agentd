@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "agentd UI Lab",
+    "slug": "agentd-ui-lab",
+    "version": "0.0.1",
+    "orientation": "default",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#08090c",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}

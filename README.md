@@ -4,6 +4,10 @@ A local-first Go control plane for durable access to autonomous agent sessions. 
 
 > Experimental and under active development. Expect breaking changes, incomplete documentation, and rough edges.
 
+## Naming
+
+The canonical project name is lowercase `agentd`. Use it for the repository, Go module, service, binary, configuration workspace ID, display name, and local checkout directory. The remote worker binary is `agentd-node`. Use “gateway” only for a generic architectural role—such as the Hermes gateway—not as this project’s identity. Tracked files must not contain workstation-specific absolute paths. `scripts/check-naming.sh` enforces this boundary in CI.
+
 ## Boundary
 
 ```text
@@ -27,6 +31,38 @@ go run ./cmd/agentd -config agentd.example.json
 Open <http://127.0.0.1:7337> for loopback development. `agentd.example.json` leaves authentication and push disabled so Air can reload without rotating secrets.
 
 `workspaceRoots` is the filesystem security boundary for Herdr discovery. The browser receives opaque workspace IDs and names, never host paths. `dataDir` holds the SQLite WAL database and must not overlap Air's `var` build directory.
+
+### UI lab
+
+`apps/ui-lab` is a fixture-driven Expo 55 comparison lab for the mobile control surface. It deliberately does not connect to the controller yet, so navigation and interaction patterns can be evaluated before the client contract is frozen:
+
+- **Fleet** — machine/session hierarchy informed by [Happy](https://github.com/slopus/happy).
+- **Focus** — conversation, tool, diff, and interaction rendering informed by [OpenCode](https://github.com/anomalyco/opencode).
+- **Ops** — node diagnostics and explicit terminal fallback informed by [Paseo](https://github.com/getpaseo/paseo) and [Orca](https://github.com/stabylai/orca).
+
+Run it in a browser:
+
+```sh
+cd apps/ui-lab
+npm install
+npm run web
+```
+
+Run it on a phone with Expo Go by scanning the QR code from:
+
+```sh
+npm start
+# If the phone cannot reach the workstation directly:
+npm start -- --tunnel
+```
+
+Validation commands:
+
+```sh
+npm run typecheck
+npm run build:web
+npx expo-doctor
+```
 
 ### Execution nodes
 
@@ -90,7 +126,7 @@ export AGENTD_VAPID_PUBLIC_KEY="<publicKey>"
 export AGENTD_VAPID_PRIVATE_KEY="<privateKey>"
 ```
 
-Then set `push.enabled` to `true` in `agentd.local.json` and keep `push.subject` as a `mailto:` or HTTPS URI. Restart with the same VAPID keys, open the installed Android PWA, and tap **Enable**; Chrome requires notification permission to follow a direct user action. `agentd` makes outbound-only, VAPID-authenticated requests to allowlisted Apple, Google, Mozilla, or Windows push services; RFC 8291 encrypts each payload for its device subscription. The gateway remains unreachable from the public internet.
+Then set `push.enabled` to `true` in `agentd.local.json` and keep `push.subject` as a `mailto:` or HTTPS URI. Restart with the same VAPID keys, open the installed Android PWA, and tap **Enable**; Chrome requires notification permission to follow a direct user action. `agentd` makes outbound-only, VAPID-authenticated requests to allowlisted Apple, Google, Mozilla, or Windows push services; RFC 8291 encrypts each payload for its device subscription. The controller remains unreachable from the public internet.
 
 ## Hot reload
 

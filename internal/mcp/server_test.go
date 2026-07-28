@@ -16,7 +16,7 @@ type testCatalog []config.Workspace
 func (c testCatalog) List(context.Context) []config.Workspace { return c }
 
 func TestToolDiscoveryAndOriginValidation(t *testing.T) {
-	server := New(testCatalog{{ID: "gateway", Name: "Agent Gateway"}}, nil, nil)
+	server := New(testCatalog{{ID: "agentd", Name: "agentd"}}, nil, nil)
 	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	responseRecorder := httptest.NewRecorder()
