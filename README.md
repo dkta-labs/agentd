@@ -28,6 +28,38 @@ Open <http://127.0.0.1:7337> for loopback development. `agentd.example.json` lea
 
 `workspaceRoots` is the filesystem security boundary for Herdr discovery. The browser receives opaque workspace IDs and names, never host paths. `dataDir` holds the SQLite WAL database and must not overlap Air's `var` build directory.
 
+### UI lab
+
+`apps/ui-lab` is a fixture-driven Expo 55 comparison lab for the mobile control surface. It deliberately does not connect to the controller yet, so navigation and interaction patterns can be evaluated before the client contract is frozen:
+
+- **Fleet** — machine/session hierarchy informed by [Happy](https://github.com/slopus/happy).
+- **Focus** — conversation, tool, diff, and interaction rendering informed by [OpenCode](https://github.com/anomalyco/opencode).
+- **Ops** — node diagnostics and explicit terminal fallback informed by [Paseo](https://github.com/getpaseo/paseo) and [Orca](https://github.com/stabylai/orca).
+
+Run it in a browser:
+
+```sh
+cd apps/ui-lab
+npm install
+npm run web
+```
+
+Run it on a phone with Expo Go by scanning the QR code from:
+
+```sh
+npm start
+# If the phone cannot reach the workstation directly:
+npm start -- --tunnel
+```
+
+Validation commands:
+
+```sh
+npm run typecheck
+npm run build:web
+npx expo-doctor
+```
+
 ### Execution nodes
 
 `agentd-node` binds another machine into the controller without exposing an inbound worker port. It authenticates outbound, reports its OS, architecture, OMP version, load, and configured workspace replicas, then long-polls for session commands. The controller prefers an online worker that has the requested workspace; when none is available, it retains the existing local execution path. Worker disconnects do not cancel owned OMP processes. Commands and events resume when the same worker reconnects, and replayed start commands are idempotent.
