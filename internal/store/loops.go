@@ -143,13 +143,12 @@ func (s *DB) StartLoop(ctx context.Context, id string, now time.Time) (LoopRecor
 	if record.CadenceSeconds == 0 {
 		return LoopRecord{}, ErrLoopManual
 	}
-	if loopStateActive(record.State) {
-		return record, nil
-	}
 	now = now.UTC()
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE loops
-		SET desired_state = 'running', state = 'scheduled', next_run_at = ?,
+		SET desired_state = 'running',
+		    state = CASE WHEN state IN ('starting', 'running', 'blocked') THEN state ELSE 'scheduled' END,
+		    next_run_at = CASE WHEN state IN ('starting', 'running', 'blocked') THEN next_run_at ELSE ? END,
 		    last_error = '', updated_at = ?
 		WHERE id = ?
 	`, encodeTime(now), encodeTime(now), id)
@@ -164,6 +163,7 @@ func (s *DB) PauseLoop(ctx context.Context, id string, now time.Time) (LoopRecor
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE loops
 		SET desired_state = 'paused',
+		    run_requested = 0,
 		    state = CASE WHEN state IN ('starting', 'running', 'blocked') THEN state ELSE 'paused' END,
 		    next_run_at = CASE WHEN state IN ('starting', 'running', 'blocked') THEN next_run_at ELSE NULL END,
 		    updated_at = ?
