@@ -1,22 +1,11 @@
 {
   "listen": "127.0.0.1:7337",
-  "publicUrl": "https://agentd.example.com",
   "dataDir": "./data",
+  "ompBinary": "omp",
+  "ompArgs": [],
+  "ompEnvFiles": {},
   "herdrBinary": "herdr",
-  "auth": {
-    "enabled": false,
-    "cookieSecure": false
-  },
-  "push": {
-    "enabled": false,
-    "subject": "mailto:you@example.com"
-  },
-  "workspaceRoots": ["."],
   "workspaces": [
-    {
-      "id": "agentd",
-      "name": "agentd",
-      "path": "."
-    }
+    { "id": "agentd", "name": "Agentd", "path": "." }
   ]
 }
