@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,10 +17,14 @@ import (
 type testWorkspaces struct{ path string }
 
 func (w testWorkspaces) Workspace(_ context.Context, id string) (config.Workspace, error) {
-	if id != "workspace" {
+	switch id {
+	case "workspace":
+		return config.Workspace{ID: id, Name: id, Path: w.path}, nil
+	case "workspace-two":
+		return config.Workspace{ID: id, Name: id, Path: w.path + "-two"}, nil
+	default:
 		return config.Workspace{}, errors.New("workspace not found")
 	}
-	return config.Workspace{ID: id, Name: id, Path: w.path}, nil
 }
 
 type testResolver struct{ runner runner.Runner }
@@ -32,9 +37,12 @@ func (r testResolver) Runner(id string) (runner.Runner, error) {
 }
 
 type testRunner struct {
+	mu           sync.Mutex
 	started      chan *testProcess
 	startEntered chan struct{}
 	startRelease chan struct{}
+	latest       *testProcess
+	attachCount  int
 }
 
 func (r *testRunner) Start(_ context.Context, job runner.Job) (runner.Process, error) {
@@ -44,10 +52,114 @@ func (r *testRunner) Start(_ context.Context, job runner.Job) (runner.Process, e
 	}
 	process := &testProcess{
 		job: job, done: make(chan struct{}), execution: "execution/" + job.RunID,
-		process: "pid=100 pgid=100", stdout: "stdout", stderr: "stderr",
+		process: "herdr-agent-" + job.RunID, stdout: "stdout", stderr: "stderr",
 	}
+	r.mu.Lock()
+	r.latest = process
+	r.mu.Unlock()
 	r.started <- process
 	return process, nil
+}
+
+func (r *testRunner) Attach(_ context.Context, _ runner.Job, reference string) (runner.Process, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.latest == nil || r.latest.process != reference {
+		return nil, runner.ErrOwnerUnavailable
+	}
+	r.attachCount++
+	return r.latest, nil
+}
+
+type preparedTestRunner struct {
+	mu             sync.Mutex
+	prepared       *preparedTestProcess
+	prepareEntered chan struct{}
+	prepareRelease chan struct{}
+	created        chan *testProcess
+	dispatchCalls  int
+	persisted      func() bool
+}
+
+type preparedTestProcess struct {
+	process  *testProcess
+	dispatch func(context.Context) error
+}
+
+func (p *preparedTestProcess) Process() runner.Process { return p.process }
+
+func (p *preparedTestProcess) Dispatch(ctx context.Context) error {
+	if p.dispatch == nil {
+		return nil
+	}
+	return p.dispatch(ctx)
+}
+
+func (r *preparedTestRunner) Start(_ context.Context, job runner.Job) (runner.Process, error) {
+	return r.newProcess(job), nil
+}
+
+func (r *preparedTestRunner) Prepare(_ context.Context, job runner.Job) (runner.Prepared, error) {
+	if r.prepareEntered != nil {
+		close(r.prepareEntered)
+		<-r.prepareRelease
+	}
+	process := r.newProcess(job)
+	return &preparedTestProcess{
+		process: process,
+		dispatch: func(context.Context) error {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.persisted != nil && !r.persisted() {
+				return errors.New("prepared ownership was not persisted")
+			}
+			r.dispatchCalls++
+			return nil
+		},
+	}, nil
+}
+func (p *preparedTestProcess) PreparedSequence() uint64 {
+	return p.process.PreparedSequence()
+}
+
+func (r *preparedTestRunner) newProcess(job runner.Job) *testProcess {
+	process := &testProcess{
+		job: job, done: make(chan struct{}), execution: "execution/" + job.RunID,
+		process: "prepared-agent-" + job.RunID, preparedSequence: 17, stdout: "stdout", stderr: "stderr",
+	}
+	r.mu.Lock()
+	r.prepared = &preparedTestProcess{process: process}
+	r.mu.Unlock()
+	if r.created != nil {
+		r.created <- process
+	}
+	return process
+}
+
+func (r *preparedTestRunner) Attach(_ context.Context, _ runner.Job, reference string) (runner.Process, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.prepared == nil || r.prepared.process.process != reference {
+		return nil, runner.ErrOwnerUnavailable
+	}
+	return r.prepared.process, nil
+}
+func (r *preparedTestRunner) AttachPrepared(_ context.Context, _ runner.Job, reference string, sequence uint64) (runner.Prepared, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.prepared == nil || r.prepared.process.process != reference {
+		return nil, runner.ErrOwnerUnavailable
+	}
+	r.prepared.process.preparedSequence = sequence
+	return &preparedTestProcess{
+		process: r.prepared.process,
+		dispatch: func(context.Context) error {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.dispatchCalls++
+			return nil
+		},
+	}, nil
 }
 
 type testProcess struct {
@@ -60,6 +172,7 @@ type testProcess struct {
 	stopErrors         []error
 	stopCalls          int
 	execution, process string
+	preparedSequence   uint64
 	stdout, stderr     string
 }
 
@@ -98,6 +211,7 @@ func (p *testProcess) complete(exit runner.Exit) {
 func (p *testProcess) ExecutionReference() string { return p.execution }
 func (p *testProcess) ProcessReference() string   { return p.process }
 func (p *testProcess) Output() (string, string)   { return p.stdout, p.stderr }
+func (p *testProcess) PreparedSequence() uint64   { return p.preparedSequence }
 
 func newTestSupervisor(t *testing.T) (*Supervisor, *testRunner) {
 	t.Helper()
@@ -120,6 +234,26 @@ func newTestSupervisor(t *testing.T) (*Supervisor, *testRunner) {
 	return sup, fake
 }
 
+func newPreparedSupervisor(t *testing.T, fake *preparedTestRunner) (*Supervisor, *store.DB) {
+	t.Helper()
+	db, err := store.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sup, err := New(db, testWorkspaces{path: t.TempDir()}, testResolver{runner: fake}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup.Start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = sup.Close(ctx)
+	})
+	return sup, db
+}
+
 func createJob(t *testing.T, sup *Supervisor, name string, cadence int) store.Job {
 	t.Helper()
 	job, err := sup.Create(context.Background(), CreateRequest{
@@ -130,6 +264,130 @@ func createJob(t *testing.T, sup *Supervisor, name string, cadence int) store.Jo
 		t.Fatal(err)
 	}
 	return job
+}
+func TestGoalKeyValidationAndRunnerThreading(t *testing.T) {
+	sup, fake := newTestSupervisor(t)
+	job, err := sup.Create(context.Background(), CreateRequest{
+		Name: "goal", WorkspaceID: "workspace", Runner: "test",
+		InvocationRequest: "do one bounded thing", GoalKey: "  goal-42  ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.GoalKey != "goal-42" {
+		t.Fatalf("created goal key = %q", job.GoalKey)
+	}
+	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	process := receiveProcess(t, fake.started)
+	if process.job.GoalKey != "goal-42" {
+		t.Fatalf("runner goal key = %q", process.job.GoalKey)
+	}
+	process.complete(runner.Exit{Code: 0})
+	waitState(t, sup, job.ID, "paused")
+
+	_, err = sup.Create(context.Background(), CreateRequest{
+		Name: "too-long-goal", WorkspaceID: "workspace", Runner: "test",
+		InvocationRequest: "do one bounded thing", GoalKey: strings.Repeat("x", 121),
+	})
+	if err == nil || !strings.Contains(err.Error(), "goalKey") {
+		t.Fatalf("long goal key error = %v", err)
+	}
+}
+func TestPreparedRunnerPersistsOwnershipBeforeDispatch(t *testing.T) {
+	fake := &preparedTestRunner{created: make(chan *testProcess, 1)}
+	sup, _ := newPreparedSupervisor(t, fake)
+	job := createJob(t, sup, "prepared ordering", 0)
+	fake.persisted = func() bool {
+		current, err := sup.Get(context.Background(), job.ID)
+		return err == nil && current.State == "starting" && current.OwnerTarget != ""
+	}
+	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	process := receiveProcess(t, fake.created)
+	waitState(t, sup, job.ID, "running")
+	fake.mu.Lock()
+	dispatches := fake.dispatchCalls
+	fake.mu.Unlock()
+	if dispatches != 1 {
+		t.Fatalf("dispatch calls = %d", dispatches)
+	}
+	process.complete(runner.Exit{Code: 0})
+	waitState(t, sup, job.ID, "paused")
+}
+
+func TestPreparedRunnerDoesNotDispatchAfterStopRequest(t *testing.T) {
+	fake := &preparedTestRunner{
+		prepareEntered: make(chan struct{}),
+		prepareRelease: make(chan struct{}),
+		created:        make(chan *testProcess, 1),
+	}
+	sup, _ := newPreparedSupervisor(t, fake)
+	job := createJob(t, sup, "prepared stop", 0)
+	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fake.prepareEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepared runner did not enter prepare")
+	}
+	if _, err := sup.StopJob(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(fake.prepareRelease)
+	process := receiveProcess(t, fake.created)
+	waitState(t, sup, job.ID, "stopped")
+	fake.mu.Lock()
+	dispatches := fake.dispatchCalls
+	fake.mu.Unlock()
+	if dispatches != 0 {
+		t.Fatalf("dispatch calls after stop = %d", dispatches)
+	}
+	process.mu.Lock()
+	stopCalls := process.stopCalls
+	process.mu.Unlock()
+	if stopCalls != 1 {
+		t.Fatalf("prepared process stop calls = %d", stopCalls)
+	}
+}
+
+func TestPreparedRunnerDoesNotDispatchAfterPersistenceFailure(t *testing.T) {
+	fake := &preparedTestRunner{
+		prepareEntered: make(chan struct{}),
+		prepareRelease: make(chan struct{}),
+		created:        make(chan *testProcess, 1),
+	}
+	sup, db := newPreparedSupervisor(t, fake)
+	job := createJob(t, sup, "prepared persistence failure", 0)
+	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fake.prepareEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepared runner did not enter prepare")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(fake.prepareRelease)
+	process := receiveProcess(t, fake.created)
+	time.Sleep(20 * time.Millisecond)
+	fake.mu.Lock()
+	dispatches := fake.dispatchCalls
+	fake.mu.Unlock()
+	if dispatches != 0 {
+		t.Fatalf("dispatch calls after persistence failure = %d", dispatches)
+	}
+	process.mu.Lock()
+	stopCalls := process.stopCalls
+	process.mu.Unlock()
+	if stopCalls != 1 {
+		t.Fatalf("prepared process stop calls = %d", stopCalls)
+	}
 }
 
 func waitState(t *testing.T, sup *Supervisor, id, state string) store.Job {
@@ -192,7 +450,13 @@ func TestManualRunExclusionSuccessAndEvidence(t *testing.T) {
 func TestUnrelatedJobsRunConcurrently(t *testing.T) {
 	sup, fake := newTestSupervisor(t)
 	first := createJob(t, sup, "first", 0)
-	second := createJob(t, sup, "second", 0)
+	second, err := sup.Create(context.Background(), CreateRequest{
+		Name: "second", WorkspaceID: "workspace-two", Runner: "test",
+		InvocationRequest: "do one bounded thing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := sup.RunNow(context.Background(), first.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -305,14 +569,136 @@ func TestCompletionSchedulesNextRunFromCompletion(t *testing.T) {
 	}
 }
 
-func TestShutdownStopsActiveRunAndRejectsNewStarts(t *testing.T) {
+func TestRecoverReattachesExistingOwnerWithoutRelaunching(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	workspacePath := t.TempDir()
+	if err := db.SeedWorkspace(ctx, config.Workspace{ID: "workspace", Name: "workspace", Path: workspacePath}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &testRunner{started: make(chan *testProcess, 1)}
+	resolver := testResolver{runner: fake}
+	first, err := New(db, testWorkspaces{path: workspacePath}, resolver, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Start(ctx)
+	job := createJob(t, first, "restart recovery", 0)
+	if _, err := first.RunNow(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	process := receiveProcess(t, fake.started)
+	running := waitState(t, first, job.ID, "running")
+	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	if err := first.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	second, err := New(db, testWorkspaces{path: workspacePath}, resolver, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		_ = second.Close(closeCtx)
+	}()
+	if err := second.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	attachments := fake.attachCount
+	fake.mu.Unlock()
+	if attachments != 1 {
+		t.Fatalf("attachment count = %d", attachments)
+	}
+	recovered, err := second.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.ActiveRunID != running.ActiveRunID || recovered.OwnerTarget != running.OwnerTarget {
+		t.Fatalf("recovered owner = %#v, original = %#v", recovered, running)
+	}
+	process.complete(runner.Exit{Code: 0})
+	settled := waitState(t, second, job.ID, "paused")
+	if settled.ActiveRunID != "" || settled.OwnerTarget != "" {
+		t.Fatalf("settled job = %#v", settled)
+	}
+	runs, err := second.Runs(ctx, job.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].ID != running.ActiveRunID {
+		t.Fatalf("runs after recovery = %#v", runs)
+	}
+}
+
+func TestRecoverInterruptsRunWhenOwnerIsGone(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	workspacePath := t.TempDir()
+	if err := db.SeedWorkspace(ctx, config.Workspace{ID: "workspace", Name: "workspace", Path: workspacePath}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &testRunner{started: make(chan *testProcess, 1)}
+	resolver := testResolver{runner: fake}
+	first, err := New(db, testWorkspaces{path: workspacePath}, resolver, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Start(ctx)
+	job := createJob(t, first, "missing restart owner", 0)
+	if _, err := first.RunNow(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	receiveProcess(t, fake.started)
+	waitState(t, first, job.ID, "running")
+	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	if err := first.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	fake.mu.Lock()
+	fake.latest = nil
+	fake.mu.Unlock()
+
+	second, err := New(db, testWorkspaces{path: workspacePath}, resolver, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	interrupted := waitState(t, second, job.ID, "interrupted")
+	if interrupted.ActiveRunID != "" || interrupted.OwnerTarget != "" || interrupted.DesiredState != "paused" {
+		t.Fatalf("interrupted job = %#v", interrupted)
+	}
+	runs, err := second.Runs(ctx, job.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].State != "interrupted" || runs[0].FinishedAt == nil {
+		t.Fatalf("interrupted runs = %#v", runs)
+	}
+}
+
+func TestShutdownDetachesWithoutStoppingActiveOwner(t *testing.T) {
 	sup, fake := newTestSupervisor(t)
 	job := createJob(t, sup, "shutdown", 0)
 	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
 		t.Fatal(err)
 	}
 	process := receiveProcess(t, fake.started)
-	waitState(t, sup, job.ID, "running")
+	running := waitState(t, sup, job.ID, "running")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := sup.Close(ctx); err != nil {
@@ -321,41 +707,19 @@ func TestShutdownStopsActiveRunAndRejectsNewStarts(t *testing.T) {
 	process.mu.Lock()
 	calls := process.stopCalls
 	process.mu.Unlock()
-	if calls != 1 {
+	if calls != 0 {
 		t.Fatalf("shutdown stop calls = %d", calls)
 	}
-	stopped := waitState(t, sup, job.ID, "stopped")
-	if stopped.ActiveRunID != "" {
-		t.Fatalf("shutdown job = %#v", stopped)
+	persisted, err := sup.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != "running" || persisted.ActiveRunID != running.ActiveRunID || persisted.OwnerTarget == "" {
+		t.Fatalf("detached job = %#v", persisted)
 	}
 	if _, err := sup.RunNow(context.Background(), job.ID); err == nil || err.Error() != "agentd is shutting down" {
 		t.Fatalf("post-shutdown run error = %v", err)
 	}
-}
-
-func TestShutdownRetriesFailedTerminationBeforeReturning(t *testing.T) {
-	sup, fake := newTestSupervisor(t)
-	job := createJob(t, sup, "shutdown retry", 0)
-	if _, err := sup.RunNow(context.Background(), job.ID); err != nil {
-		t.Fatal(err)
-	}
-	process := receiveProcess(t, fake.started)
-	waitState(t, sup, job.ID, "running")
-	process.mu.Lock()
-	process.stopErrors = []error{errors.New("transient stop failure"), nil}
-	process.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := sup.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	process.mu.Lock()
-	calls := process.stopCalls
-	process.mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("shutdown stop calls = %d", calls)
-	}
-	waitState(t, sup, job.ID, "stopped")
 }
 
 func TestStopCancelsClaimedRunBeforeProcessRegistration(t *testing.T) {
@@ -417,67 +781,11 @@ func TestCloseDeadlineAppliesWhileRunnerStartIsPending(t *testing.T) {
 	if err := sup.Close(closeCtx); err != nil {
 		t.Fatal(err)
 	}
-	waitState(t, sup, job.ID, "stopped")
-}
-
-type serialVisibilityReporter struct {
-	mu      sync.Mutex
-	active  int
-	max     int
-	calls   int
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (r *serialVisibilityReporter) Report(context.Context, config.Workspace, Visibility) error {
-	r.mu.Lock()
-	r.active++
-	r.calls++
-	if r.active > r.max {
-		r.max = r.active
+	persisted, err := sup.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	r.once.Do(func() { close(r.entered) })
-	r.mu.Unlock()
-	<-r.release
-	r.mu.Lock()
-	r.active--
-	r.mu.Unlock()
-	return nil
-}
-
-func TestWorkspaceVisibilityReportsAreSerialized(t *testing.T) {
-	sup, _ := newTestSupervisor(t)
-	createJob(t, sup, "visibility", 0)
-	reporter := &serialVisibilityReporter{entered: make(chan struct{}), release: make(chan struct{})}
-	sup.SetVisibilityReporter(reporter)
-
-	results := make(chan error, 2)
-	go func() { results <- sup.reportWorkspace(context.Background(), "workspace") }()
-	select {
-	case <-reporter.entered:
-	case <-time.After(time.Second):
-		t.Fatal("first visibility report did not start")
-	}
-	go func() { results <- sup.reportWorkspace(context.Background(), "workspace") }()
-	time.Sleep(20 * time.Millisecond)
-
-	reporter.mu.Lock()
-	maxActive := reporter.max
-	callsBeforeRelease := reporter.calls
-	reporter.mu.Unlock()
-	if maxActive != 1 || callsBeforeRelease != 1 {
-		t.Fatalf("concurrent reports before release: max=%d calls=%d", maxActive, callsBeforeRelease)
-	}
-	close(reporter.release)
-	for range 2 {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if reporter.max != 1 || reporter.calls != 2 {
-		t.Fatalf("serialized reports: max=%d calls=%d", reporter.max, reporter.calls)
+	if persisted.ActiveRunID == "" {
+		t.Fatalf("pending owner was cleared during detach: %#v", persisted)
 	}
 }

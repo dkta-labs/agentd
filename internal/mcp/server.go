@@ -140,6 +140,7 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		Runner            string `json:"runner"`
 		InvocationRequest string `json:"invocationRequest"`
 		CadenceSeconds    int    `json:"cadenceSeconds"`
+		GoalKey           string `json:"goalKey"`
 		Limit             int    `json:"limit"`
 	}
 	if err := decodeParams(raw, &arguments); err != nil {
@@ -147,7 +148,7 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 	}
 	definition := supervisor.CreateRequest{
 		Name: arguments.Name, WorkspaceID: arguments.WorkspaceID, Runner: arguments.Runner,
-		InvocationRequest: arguments.InvocationRequest, CadenceSeconds: arguments.CadenceSeconds,
+		InvocationRequest: arguments.InvocationRequest, CadenceSeconds: arguments.CadenceSeconds, GoalKey: arguments.GoalKey,
 	}
 	switch name {
 	case "agentd_job_create":
@@ -204,7 +205,7 @@ func tools() []tool {
 	definitionProperties := map[string]any{
 		"name": map[string]string{"type": "string"}, "workspaceId": map[string]string{"type": "string"},
 		"runner": map[string]string{"type": "string"}, "invocationRequest": map[string]string{"type": "string"},
-		"cadenceSeconds": map[string]string{"type": "integer"},
+		"cadenceSeconds": map[string]string{"type": "integer"}, "goalKey": map[string]string{"type": "string"},
 	}
 	definitionSchema := map[string]any{"type": "object", "properties": definitionProperties, "required": []string{"name", "workspaceId", "invocationRequest"}, "additionalProperties": false}
 	idSchema := map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}}, "required": []string{"id"}, "additionalProperties": false}

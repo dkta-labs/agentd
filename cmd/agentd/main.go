@@ -23,10 +23,10 @@ import (
 	"github.com/dkta-labs/agentd/internal/herdr"
 	"github.com/dkta-labs/agentd/internal/httpapi"
 	"github.com/dkta-labs/agentd/internal/mcp"
-	"github.com/dkta-labs/agentd/internal/omp"
 	"github.com/dkta-labs/agentd/internal/runner"
 	"github.com/dkta-labs/agentd/internal/store"
 	"github.com/dkta-labs/agentd/internal/supervisor"
+	"github.com/dkta-labs/agentd/internal/top"
 )
 
 type workspaces struct{ store *store.DB }
@@ -126,7 +126,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentd: usage: agentd [global options] daemon")
 			return 2
 		}
-	case "status", "jobs", "workspaces":
+	case "status", "top", "jobs", "workspaces":
 	default:
 		fmt.Fprintf(stderr, "agentd: unknown command %q\n\n", command)
 		printRootUsage(stderr)
@@ -142,9 +142,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = serve(cfg)
 	case "status":
 		err = adminStatus(cfg, args[1:], stdout, stderr)
+	case "top":
+		err = runTop(cfg, args[1:], stdout)
 	default:
 		err = admin(cfg, args, stdout)
 	}
+
 	if err != nil {
 		fmt.Fprintln(stderr, "agentd:", err)
 		return 1
@@ -160,7 +163,7 @@ func handleHelp(args []string, output io.Writer) (bool, error) {
 	switch {
 	case args[0] == "help":
 		path = args[1:]
-	case len(args) >= 2 && args[1] == "help" && (args[0] == "jobs" || args[0] == "workspaces"):
+	case len(args) >= 2 && args[1] == "help":
 		path = append([]string{args[0]}, args[2:]...)
 	case isHelpFlag(args[len(args)-1]):
 		path = args[:len(args)-1]
@@ -185,6 +188,8 @@ func printHelpPath(output io.Writer, path []string) error {
 			fmt.Fprintln(output, "Usage: agentd [global options] daemon\n\nStart the Agentd daemon in the foreground. Running agentd without a command does the same thing.")
 		case "status":
 			printStatusUsage(output)
+		case "top":
+			fmt.Fprintln(output, "Usage: agentd [global options] top [--once] [--interval DURATION] [--no-clear] [--address URL]\n\nRefresh a read-only terminal view of job, run, and Herdr owner lifecycle state.")
 		case "jobs":
 			printJobsUsage(output)
 		case "workspaces":
@@ -210,6 +215,7 @@ func printRootUsage(output io.Writer) {
   agentd [global options]                         Start the daemon
   agentd [global options] daemon                  Start the daemon explicitly
   agentd [global options] status [--json]         Check daemon health
+  agentd [global options] top [options]             Watch job, run, and owner lifecycle
   agentd [global options] jobs <command>           Manage scheduled jobs
   agentd [global options] workspaces <command>     Manage workspace registry
   agentd help [command]                            Show command help
@@ -232,14 +238,33 @@ Options:
 `)
 }
 
+func runTop(cfg config.Config, args []string, output io.Writer) error {
+	options, err := top.ParseOptions(args, "http://"+cfg.Listen)
+	if err != nil {
+		return err
+	}
+	interactive := false
+	if file, ok := output.(*os.File); ok {
+		if info, statErr := file.Stat(); statErr == nil {
+			interactive = info.Mode()&os.ModeCharDevice != 0
+		}
+	}
+	if !interactive {
+		options.Once = true
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return top.Execute(ctx, options, output, interactive)
+}
+
 func printJobsUsage(output io.Writer) {
 	fmt.Fprint(output, `Usage: agentd [global options] jobs <command>
 
 Commands:
   list
   get JOB_ID
-  create -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS]
-  update -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] JOB_ID
+  create -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] [-goal KEY]
+  update -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] [-goal KEY] JOB_ID
   start JOB_ID
   pause JOB_ID
   run JOB_ID
@@ -264,9 +289,9 @@ func printJobCommandUsage(output io.Writer, command string) error {
 	case "get", "start", "pause", "run", "stop", "runs":
 		fmt.Fprintf(output, "Usage: agentd [global options] jobs %s JOB_ID\n", command)
 	case "create":
-		fmt.Fprintln(output, "Usage: agentd [global options] jobs create -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS]")
+		fmt.Fprintln(output, "Usage: agentd [global options] jobs create -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] [-goal KEY]")
 	case "update":
-		fmt.Fprintln(output, "Usage: agentd [global options] jobs update -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] JOB_ID")
+		fmt.Fprintln(output, "Usage: agentd [global options] jobs update -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] [-goal KEY] JOB_ID")
 	default:
 		return fmt.Errorf("unknown jobs command %q", command)
 	}
@@ -358,11 +383,11 @@ func open(cfg config.Config) (*store.DB, *supervisor.Supervisor, error) {
 			return nil, nil, fmt.Errorf("seed workspace %q: %w", workspace.ID, err)
 		}
 	}
-	registry := runner.NewRegistry(map[string]runner.Runner{"omp": omp.Runner{Binary: cfg.OMPBinary, Args: cfg.OMPArgs, EnvFiles: cfg.OMPEnvFiles, SessionRoot: filepath.Join(cfg.DataDir, "runs")}})
+	registry := runner.NewRegistry(map[string]runner.Runner{"omp": herdr.Runner{
+		Binary: cfg.HerdrBinary, AgentArgs: cfg.AgentArgs, AgentEnv: cfg.AgentEnv,
+		CoordinatorTarget: cfg.CoordinatorTarget,
+	}})
 	sup, err := supervisor.New(db, workspaces{store: db}, registry, slog.Default())
-	if err == nil {
-		sup.SetVisibilityReporter(herdr.Reporter{Binary: cfg.HerdrBinary})
-	}
 	if err != nil {
 		_ = db.Close()
 		return nil, nil, err
@@ -380,11 +405,8 @@ func serve(cfg config.Config) error {
 		return err
 	}
 	defer db.Close()
-	if err := db.RecoverInterrupted(context.Background(), time.Now().UTC()); err != nil {
+	if err := sup.Recover(context.Background()); err != nil {
 		return err
-	}
-	if err := sup.SyncVisibility(context.Background()); err != nil {
-		slog.Warn("initial workspace visibility sync failed", "error", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -408,8 +430,7 @@ func serve(cfg config.Config) error {
 	shutdownErr := server.Shutdown(shutdownCtx)
 	closeErr := sup.Close(shutdownCtx)
 	if closeErr != nil {
-		slog.Error("shutdown could not confirm process termination; retaining ownership and retrying", "error", closeErr)
-		closeErr = sup.Close(context.Background())
+		slog.Error("shutdown could not detach every Agentd watcher within the deadline", "error", closeErr)
 	}
 	return errors.Join(terminalErr, shutdownErr, closeErr)
 }
@@ -477,6 +498,7 @@ func parseAdminWrite(args []string) (supervisor.CreateRequest, string, error) {
 	request := fs.String("request", "", "invocation request")
 	runnerName := fs.String("runner", "omp", "runner id")
 	cadence := fs.Int("cadence", 0, "cadence seconds")
+	goalKey := fs.String("goal", "", "optional durable goal key")
 	if err := fs.Parse(args[2:]); err != nil {
 		return supervisor.CreateRequest{}, "", err
 	}
@@ -487,7 +509,7 @@ func parseAdminWrite(args []string) (supervisor.CreateRequest, string, error) {
 		}
 		id = fs.Arg(0)
 	}
-	return supervisor.CreateRequest{Name: *name, WorkspaceID: *workspace, Runner: *runnerName, InvocationRequest: *request, CadenceSeconds: *cadence}, id, nil
+	return supervisor.CreateRequest{Name: *name, WorkspaceID: *workspace, Runner: *runnerName, InvocationRequest: *request, CadenceSeconds: *cadence, GoalKey: *goalKey}, id, nil
 }
 func adminWorkspaces(cfg config.Config, args []string, stdout io.Writer) error {
 	if len(args) < 1 {

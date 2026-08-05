@@ -21,4 +21,4 @@ Runner integrations must remain replaceable. Keep the core seam limited to lifec
 
 Canonical rationale: `~/grimoire/decisions/2026-07-30-agentd-scheduled-agent-supervisor.html`.
 
-Implementation authority: [DKT-67](https://linear.app/dkta-labs/issue/DKT-67/cut-agentd-over-to-the-minimal-scheduled-agent-supervisor). Historical scheduler-core evidence: [DKT-61](https://linear.app/dkta-labs/issue/DKT-61/simplify-agentd-to-an-omp-cron-and-process-wrapper).
+Implementation authority: [DKT-139](https://linear.app/dkta-labs/issue/DKT-139/dispatch-agentd-work-as-detached-interactive-herdr-agents). Historical core-cutover evidence: [DKT-67](https://linear.app/dkta-labs/issue/DKT-67/cut-agentd-over-to-the-minimal-scheduled-agent-supervisor).

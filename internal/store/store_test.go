@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -80,11 +81,80 @@ func TestManualRunPersistsEvidenceAndSuccessfulExit(t *testing.T) {
 		t.Fatalf("run evidence = %#v", got)
 	}
 }
+func TestPreparedEvidencePersistsWithoutAdvancingRun(t *testing.T) {
+	db := openTestDB(t)
+	job := createManualJob(t, db, "prepared-job")
+	_, run := claimManualRun(t, db, job.ID, "prepared-run", time.Now().UTC())
+	if err := db.SetRunPreparedEvidence(context.Background(), job.ID, run.ID, "session/prepared.jsonl", "owner-prepared", 17); err != nil {
+		t.Fatal(err)
+	}
+	storedJob, err := db.Job(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedRun, err := db.Run(context.Background(), job.ID, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedJob.State != "starting" || storedJob.ActiveRunID != run.ID || storedJob.OwnerTarget != "owner-prepared" {
+		t.Fatalf("prepared job = %#v", storedJob)
+	}
+	if storedRun.State != "starting" || storedRun.ExecutionReference != "session/prepared.jsonl" || storedRun.ProcessReference != "owner-prepared" || storedRun.PreparedSequence != 17 {
+		t.Fatalf("prepared run = %#v", storedRun)
+	}
+}
+
+func TestGoalKeyPersistsThroughCreateAndUpdate(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	created, err := db.CreateJob(ctx, Job{
+		ID: "goal-job", Name: "Goal", WorkspaceID: "workspace", GoalKey: "goal-one",
+		InvocationRequest: "do one thing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.GoalKey != "goal-one" {
+		t.Fatalf("created goal key = %q", created.GoalKey)
+	}
+	var encoded map[string]any
+	data, err := json.Marshal(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if encoded["goalKey"] != "goal-one" {
+		t.Fatalf("serialized goal key = %#v", encoded["goalKey"])
+	}
+	created.GoalKey = "goal-two"
+	updated, err := db.UpdateJob(ctx, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.GoalKey != "goal-two" {
+		t.Fatalf("updated goal key = %q", updated.GoalKey)
+	}
+	stored, err := db.Job(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.GoalKey != "goal-two" {
+		t.Fatalf("stored goal key = %q", stored.GoalKey)
+	}
+}
 
 func TestSameJobExcludedAndUnrelatedJobsRemainClaimable(t *testing.T) {
 	db := openTestDB(t)
 	first := createManualJob(t, db, "first")
-	second := createManualJob(t, db, "second")
+	second, err := db.CreateJob(context.Background(), Job{
+		ID: "second", Name: "second", WorkspaceID: "workspace-two", Runner: "test",
+		InvocationRequest: "do one thing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	_, firstRun := claimManualRun(t, db, first.ID, "run-first", now)
 	if _, err := db.RequestRun(context.Background(), first.ID, now); !errors.Is(err, ErrActive) {
@@ -102,6 +172,61 @@ func TestSameJobExcludedAndUnrelatedJobsRemainClaimable(t *testing.T) {
 	}
 	if firstRun.JobID != first.ID {
 		t.Fatalf("first run belongs to %q", firstRun.JobID)
+	}
+}
+
+func TestClaimExcludesGoalAndWorkspaceCollisionsButClaimsIndependentJob(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	sharedPath := filepath.Join(t.TempDir(), "shared")
+	paths := map[string]string{
+		"workspace-active": sharedPath,
+		"workspace-path":   sharedPath,
+		"workspace-other":  filepath.Join(t.TempDir(), "other"),
+		"workspace-free":   filepath.Join(t.TempDir(), "free"),
+	}
+	for id, path := range paths {
+		if err := db.SeedWorkspace(ctx, config.Workspace{ID: id, Name: id, Path: path}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create := func(id, workspaceID, goalKey string) Job {
+		job, err := db.CreateJob(ctx, Job{
+			ID: id, Name: id, WorkspaceID: workspaceID, GoalKey: goalKey,
+			InvocationRequest: "do one thing",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+	active := create("active", "workspace-active", "goal-active")
+	_, _ = claimManualRun(t, db, active.ID, "run-active", time.Now().UTC())
+	goalCollision := create("goal-collision", "workspace-other", "goal-active")
+	workspaceCollision := create("workspace-collision", "workspace-active", "goal-other")
+	pathCollision := create("path-collision", "workspace-path", "goal-path")
+	independent := create("independent", "workspace-free", "goal-free")
+	now := time.Now().UTC()
+	for _, job := range []Job{goalCollision, workspaceCollision, pathCollision, independent} {
+		if _, err := db.RequestRun(ctx, job.ID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimedJob, _, claimed, err := db.ClaimNext(ctx, now, "run-independent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed || claimedJob.ID != independent.ID {
+		t.Fatalf("independent claim = claimed %v job %q", claimed, claimedJob.ID)
+	}
+	for _, id := range []string{goalCollision.ID, workspaceCollision.ID, pathCollision.ID} {
+		job, err := db.Job(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.State != "scheduled" || !job.RunRequested {
+			t.Fatalf("collision job %q = state %q requested %v", id, job.State, job.RunRequested)
+		}
 	}
 }
 
@@ -139,53 +264,6 @@ func TestFailureAndStopConfirmationOwnActiveRun(t *testing.T) {
 	}
 	if stopped.State != "stopped" || stopped.ActiveRunID != "" || stopped.LastError != "" {
 		t.Fatalf("confirmed stop = %#v", stopped)
-	}
-}
-
-func TestRestartRecoveryIsExplicitAndDoesNotRunOnAdministrativeOpen(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	db, err := Open(ctx, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	job := createManualJob(t, db, "restart-job")
-	now := time.Now().UTC()
-	_, run := claimManualRun(t, db, job.ID, "restart-run", now)
-	if err := db.SetRunRunning(ctx, job.ID, run.ID, "execution", "process"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	admin, err := Open(ctx, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer admin.Close()
-	before, err := admin.Job(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before.State != "running" || before.ActiveRunID != run.ID {
-		t.Fatalf("administrative open mutated active job: %#v", before)
-	}
-	if err := admin.RecoverInterrupted(ctx, now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	after, err := admin.Job(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.State != "interrupted" || after.ActiveRunID != "" || after.DesiredState != "paused" {
-		t.Fatalf("recovered job = %#v", after)
-	}
-	runs, err := admin.Runs(ctx, job.ID, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].State != "interrupted" || runs[0].FinishedAt == nil {
-		t.Fatalf("recovered runs = %#v", runs)
 	}
 }
 
@@ -242,7 +320,7 @@ func TestLegacyMigrationPreservesJobsAndRunsThenDropsObsoleteTables(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.InvocationRequest != "legacy request" || job.Runner != "omp" {
+	if job.InvocationRequest != "legacy request" || job.Runner != "omp" || job.GoalKey != "" {
 		t.Fatalf("migrated job = %#v", job)
 	}
 	runs, err := migrated.Runs(ctx, job.ID, 10)
@@ -267,6 +345,48 @@ func TestLegacyMigrationPreservesJobsAndRunsThenDropsObsoleteTables(t *testing.T
 	}
 	if len(tables) != 3 || tables[0] != "jobs" || tables[1] != "runs" || tables[2] != "workspaces" {
 		t.Fatalf("remaining tables = %v", tables)
+	}
+}
+
+func TestExistingJobsMigrateWithEmptyGoalKey(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agentd.sqlite")
+	legacy, err := sql.Open("sqlite3", "file:"+path+"?_foreign_keys=on")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+		CREATE TABLE jobs(
+			id TEXT PRIMARY KEY, name TEXT NOT NULL, workspace_id TEXT NOT NULL,
+			runner TEXT NOT NULL, invocation_request TEXT NOT NULL,
+			cadence_seconds INTEGER NOT NULL, desired_state TEXT NOT NULL, state TEXT NOT NULL,
+			iteration INTEGER NOT NULL, run_requested INTEGER NOT NULL, active_run_id TEXT NOT NULL,
+			active_owner_target TEXT NOT NULL, next_run_at TEXT, last_run_at TEXT,
+			last_error TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);
+		INSERT INTO jobs VALUES(
+			'old-job','Old','workspace','test','old request',0,'paused','paused',
+			0,0,'','',NULL,NULL,'','2026-07-30T12:00:00Z','2026-07-30T12:00:00Z'
+		);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	job, err := migrated.Job(ctx, "old-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.GoalKey != "" {
+		t.Fatalf("migrated goal key = %q", job.GoalKey)
 	}
 }
 
