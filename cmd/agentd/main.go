@@ -93,11 +93,24 @@ func (s service) ListWorkspaces(ctx context.Context) ([]config.Workspace, error)
 	return s.store.Workspaces(ctx)
 }
 
+const waitPollInterval = 250 * time.Millisecond
+
+var errWaitTimeout = errors.New("timed out waiting for job")
+
+type jobWaitOutput struct {
+	Job       store.Job  `json:"job"`
+	LatestRun *store.Run `json:"latestRun"`
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runContext(context.Background(), args, stdout, stderr)
+}
+
+func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	global := flag.NewFlagSet("agentd", flag.ContinueOnError)
 	global.SetOutput(stderr)
 	global.Usage = func() { printRootUsage(stdout) }
@@ -145,12 +158,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "top":
 		err = runTop(cfg, args[1:], stdout)
 	default:
-		err = admin(cfg, args, stdout)
+		if command == "jobs" && len(args) > 1 && args[1] == "wait" {
+			waitCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			err = adminContext(waitCtx, cfg, args, stdout)
+			stop()
+		} else {
+			err = adminContext(ctx, cfg, args, stdout)
+		}
 	}
 
 	if err != nil {
 		fmt.Fprintln(stderr, "agentd:", err)
-		return 1
+		switch {
+		case errors.Is(err, errWaitTimeout):
+			return 124
+		case errors.Is(err, context.Canceled):
+			return 130
+		default:
+			return 1
+		}
 	}
 	return 0
 }
@@ -270,6 +296,7 @@ Commands:
   run JOB_ID
   stop JOB_ID
   runs JOB_ID
+  wait JOB_ID [--timeout DURATION]
 `)
 }
 
@@ -288,6 +315,8 @@ func printJobCommandUsage(output io.Writer, command string) error {
 		fmt.Fprintln(output, "Usage: agentd [global options] jobs list")
 	case "get", "start", "pause", "run", "stop", "runs":
 		fmt.Fprintf(output, "Usage: agentd [global options] jobs %s JOB_ID\n", command)
+	case "wait":
+		fmt.Fprintln(output, "Usage: agentd [global options] jobs wait JOB_ID [--timeout DURATION]")
 	case "create":
 		fmt.Fprintln(output, "Usage: agentd [global options] jobs create -name NAME -workspace ID -request TEXT [-runner ID] [-cadence SECONDS] [-goal KEY]")
 	case "update":
@@ -445,6 +474,10 @@ func newHandler(api service) http.Handler {
 	return mux
 }
 func admin(cfg config.Config, args []string, stdout io.Writer) error {
+	return adminContext(context.Background(), cfg, args, stdout)
+}
+
+func adminContext(ctx context.Context, cfg config.Config, args []string, stdout io.Writer) error {
 	if len(args) < 2 {
 		return errors.New("usage: agentd <jobs|workspaces> <command>")
 	}
@@ -454,7 +487,6 @@ func admin(cfg config.Config, args []string, stdout io.Writer) error {
 	if args[0] != "jobs" {
 		return errors.New("usage: agentd <jobs|workspaces> <command>")
 	}
-	ctx := context.Background()
 	method, path := http.MethodGet, "/jobs"
 	var body []byte
 	switch args[1] {
@@ -472,6 +504,12 @@ func admin(cfg config.Config, args []string, stdout io.Writer) error {
 		} else if args[1] != "get" {
 			method = http.MethodPost
 		}
+	case "wait":
+		id, timeout, err := parseWaitArgs(args[2:])
+		if err != nil {
+			return err
+		}
+		return waitForJob(ctx, cfg, id, timeout, waitPollInterval, stdout)
 	case "create", "update":
 		request, id, err := parseAdminWrite(args)
 		if err != nil {
@@ -490,6 +528,129 @@ func admin(cfg config.Config, args []string, stdout io.Writer) error {
 		return errors.New("unknown jobs command")
 	}
 	return callAdmin(ctx, cfg, method, path, body, stdout)
+}
+
+func parseWaitArgs(args []string) (string, time.Duration, error) {
+	const usage = "usage: agentd jobs wait JOB_ID [--timeout DURATION]"
+	var (
+		id         string
+		timeout    time.Duration
+		timeoutSet bool
+	)
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		var timeoutValue string
+		timeoutOption := false
+		switch {
+		case arg == "-timeout" || arg == "--timeout":
+			timeoutOption = true
+			if index+1 >= len(args) {
+				return "", 0, errors.New(usage)
+			}
+			index++
+			timeoutValue = args[index]
+		case strings.HasPrefix(arg, "-timeout="):
+			timeoutOption = true
+			timeoutValue = strings.TrimPrefix(arg, "-timeout=")
+		case strings.HasPrefix(arg, "--timeout="):
+			timeoutOption = true
+			timeoutValue = strings.TrimPrefix(arg, "--timeout=")
+		case strings.HasPrefix(arg, "-"):
+			return "", 0, fmt.Errorf("%s: unknown option %q", usage, arg)
+		case id == "":
+			id = arg
+		default:
+			return "", 0, errors.New(usage)
+		}
+		if !timeoutOption {
+			continue
+		}
+		if timeoutSet {
+			return "", 0, fmt.Errorf("%s: timeout specified more than once", usage)
+		}
+		parsed, err := time.ParseDuration(timeoutValue)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid timeout %q: %w", timeoutValue, err)
+		}
+		if parsed <= 0 {
+			return "", 0, errors.New("timeout must be greater than zero")
+		}
+		timeout, timeoutSet = parsed, true
+	}
+	if id == "" {
+		return "", 0, errors.New(usage)
+	}
+	return id, timeout, nil
+}
+
+func waitForJob(ctx context.Context, cfg config.Config, id string, timeout, pollInterval time.Duration, stdout io.Writer) error {
+	waitCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		timeoutErr := fmt.Errorf("%w %q after %s", errWaitTimeout, id, timeout)
+		waitCtx, cancel = context.WithTimeoutCause(ctx, timeout, timeoutErr)
+	}
+	defer cancel()
+
+	if pollInterval <= 0 {
+		pollInterval = waitPollInterval
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	client := &http.Client{Timeout: 15 * time.Second}
+	jobPath := "/jobs/" + url.PathEscape(id)
+
+	for {
+		var job store.Job
+		if err := getAdminJSON(waitCtx, client, cfg, jobPath, &job); err != nil {
+			if cause := context.Cause(waitCtx); cause != nil {
+				return cause
+			}
+			return err
+		}
+		if !jobIsActive(job) {
+			var runs []store.Run
+			if err := getAdminJSON(waitCtx, client, cfg, jobPath+"/runs?limit=1", &runs); err != nil {
+				if cause := context.Cause(waitCtx); cause != nil {
+					return cause
+				}
+				return err
+			}
+			var latest *store.Run
+			if len(runs) > 0 {
+				latest = &runs[0]
+			}
+			return json.NewEncoder(stdout).Encode(jobWaitOutput{Job: job, LatestRun: latest})
+		}
+		select {
+		case <-waitCtx.Done():
+			return context.Cause(waitCtx)
+		case <-ticker.C:
+		}
+	}
+}
+
+func jobIsActive(job store.Job) bool {
+	if job.RunRequested || job.ActiveRunID != "" {
+		return true
+	}
+	switch job.State {
+	case "starting", "running", "stopping":
+		return true
+	default:
+		return false
+	}
+}
+
+func getAdminJSON(ctx context.Context, client *http.Client, cfg config.Config, path string, target any) error {
+	payload, err := requestAdmin(ctx, client, cfg, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		return fmt.Errorf("decode agentd daemon response: %w", err)
+	}
+	return nil
 }
 func parseAdminWrite(args []string) (supervisor.CreateRequest, string, error) {
 	fs := flag.NewFlagSet(args[1], flag.ContinueOnError)
@@ -547,31 +708,39 @@ func adminWorkspaces(cfg config.Config, args []string, stdout io.Writer) error {
 }
 
 func callAdmin(ctx context.Context, cfg config.Config, method, path string, body []byte, stdout io.Writer) error {
-	request, err := http.NewRequestWithContext(ctx, method, "http://"+cfg.Listen+path, bytes.NewReader(body))
+	payload, err := requestAdmin(ctx, &http.Client{Timeout: 15 * time.Second}, cfg, method, path, body)
 	if err != nil {
 		return err
+	}
+	_, err = stdout.Write(payload)
+	return err
+}
+
+func requestAdmin(ctx context.Context, client *http.Client, cfg config.Config, method, path string, body []byte) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, method, "http://"+cfg.Listen+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 	if len(body) > 0 {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("contact agentd daemon: %w", err)
+		return nil, fmt.Errorf("contact agentd daemon: %w", err)
 	}
 	defer response.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var failure struct {
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(payload, &failure) == nil && strings.TrimSpace(failure.Error) != "" {
-			return errors.New(failure.Error)
+			return nil, errors.New(failure.Error)
 		}
-		return fmt.Errorf("agentd daemon returned %s", response.Status)
+		return nil, fmt.Errorf("agentd daemon returned %s", response.Status)
 	}
-	_, err = stdout.Write(payload)
-	return err
+	return payload, nil
 }

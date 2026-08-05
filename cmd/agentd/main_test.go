@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dkta-labs/agentd/internal/config"
 	"github.com/dkta-labs/agentd/internal/httpapi"
@@ -86,6 +88,178 @@ func TestAdminStopRoutesThroughOwningDaemon(t *testing.T) {
 	}
 }
 
+func TestAdminWaitActiveToTerminalIncludesLatestRun(t *testing.T) {
+	var jobGets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs/job-active":
+			job := store.Job{ID: "job-active", State: "paused"}
+			if jobGets.Add(1) == 1 {
+				job.State = "running"
+				job.ActiveRunID = "run-current"
+			}
+			_ = json.NewEncoder(w).Encode(job)
+		case "/jobs/job-active/runs":
+			if r.URL.Query().Get("limit") != "1" {
+				t.Errorf("runs limit = %q", r.URL.Query().Get("limit"))
+			}
+			_ = json.NewEncoder(w).Encode([]store.Run{{
+				ID:       "run-current",
+				JobID:    "job-active",
+				State:    "completed",
+				ExitCode: new(0),
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{Listen: strings.TrimPrefix(server.URL, "http://")}
+	var output bytes.Buffer
+	if err := waitForJob(context.Background(), cfg, "job-active", time.Second, time.Millisecond, &output); err != nil {
+		t.Fatal(err)
+	}
+	var result jobWaitOutput
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Job.ID != "job-active" || result.Job.State != "paused" {
+		t.Fatalf("final job = %#v", result.Job)
+	}
+	if result.LatestRun == nil || result.LatestRun.ID != "run-current" || result.LatestRun.State != "completed" {
+		t.Fatalf("latest run = %#v", result.LatestRun)
+	}
+	if jobGets.Load() < 2 {
+		t.Fatalf("job GET count = %d; want at least 2", jobGets.Load())
+	}
+}
+
+func TestAdminWaitReturnsImmediatelyForTerminalJob(t *testing.T) {
+	for _, state := range []string{"paused", "failed", "interrupted", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			var jobGets, runGets atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/jobs/job-terminal":
+					jobGets.Add(1)
+					_ = json.NewEncoder(w).Encode(store.Job{ID: "job-terminal", State: state})
+				case "/jobs/job-terminal/runs":
+					runGets.Add(1)
+					_ = json.NewEncoder(w).Encode([]store.Run(nil))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			cfg := config.Config{Listen: strings.TrimPrefix(server.URL, "http://")}
+			var output bytes.Buffer
+			if err := waitForJob(context.Background(), cfg, "job-terminal", time.Second, time.Hour, &output); err != nil {
+				t.Fatal(err)
+			}
+			if jobGets.Load() != 1 || runGets.Load() != 1 {
+				t.Fatalf("GET counts = job %d, runs %d; want 1 each", jobGets.Load(), runGets.Load())
+			}
+			var result jobWaitOutput
+			if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Job.State != state || result.LatestRun != nil {
+				t.Fatalf("wait result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestParseWaitArgsRejectsEmptyTimeout(t *testing.T) {
+	if _, _, err := parseWaitArgs([]string{"job-active", "--timeout="}); err == nil {
+		t.Fatal("empty timeout unexpectedly succeeded")
+	}
+}
+
+func TestRunWaitTimeoutHasDistinctExitAndDoesNotStopRun(t *testing.T) {
+	var mutatingRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			mutatingRequests.Add(1)
+		}
+		_ = json.NewEncoder(w).Encode(store.Job{
+			ID:          "job-active",
+			State:       "running",
+			ActiveRunID: "run-current",
+		})
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, strings.TrimPrefix(server.URL, "http://"))
+	var stdout, stderr bytes.Buffer
+	code := runContext(context.Background(), []string{
+		"-config", configPath,
+		"jobs", "wait", "job-active", "--timeout", "20ms",
+	}, &stdout, &stderr)
+	if code != 124 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `timed out waiting for job "job-active" after 20ms`) {
+		t.Fatalf("timeout stderr = %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("timeout stdout = %q", stdout.String())
+	}
+	if mutatingRequests.Load() != 0 {
+		t.Fatalf("wait sent %d mutating requests", mutatingRequests.Load())
+	}
+}
+
+func TestRunWaitCancellationDoesNotStopRun(t *testing.T) {
+	requestStarted := make(chan struct{})
+	var mutatingRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			mutatingRequests.Add(1)
+		}
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, strings.TrimPrefix(server.URL, "http://"))
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout, stderr bytes.Buffer
+	result := make(chan int, 1)
+	go func() {
+		result <- runContext(ctx, []string{
+			"-config", configPath,
+			"jobs", "wait", "job-active",
+		}, &stdout, &stderr)
+	}()
+
+	select {
+	case <-requestStarted:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("wait request did not start")
+	}
+	select {
+	case code := <-result:
+		if code != 130 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not stop after cancellation")
+	}
+	if !strings.Contains(stderr.String(), context.Canceled.Error()) {
+		t.Fatalf("cancellation stderr = %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("cancellation stdout = %q", stdout.String())
+	}
+	if mutatingRequests.Load() != 0 {
+		t.Fatalf("wait sent %d mutating requests", mutatingRequests.Load())
+	}
+}
+
 func TestAdminRegistersWorkspaceThroughRunningDaemon(t *testing.T) {
 	service := &adminService{registered: make(chan config.Workspace, 1)}
 	server := httptest.NewServer(httpapi.New(service).Handler())
@@ -141,7 +315,7 @@ func TestRunCommandHelpListsJobOperations(t *testing.T) {
 	if code := run([]string{"help", "jobs"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
-	for _, expected := range []string{"create", "update", "start", "pause", "run", "stop", "runs", "-goal KEY"} {
+	for _, expected := range []string{"create", "update", "start", "pause", "run", "stop", "runs", "wait JOB_ID", "-goal KEY"} {
 		if !strings.Contains(stdout.String(), expected) {
 			t.Fatalf("jobs help does not contain %q:\n%s", expected, stdout.String())
 		}
@@ -161,6 +335,10 @@ func TestRunSubcommandHelpDoesNotLoadConfigOrContactDaemon(t *testing.T) {
 		"jobs nested help": {
 			args:     []string{"-config", missingConfig, "jobs", "help", "list"},
 			expected: "jobs list",
+		},
+		"jobs wait": {
+			args:     []string{"-config", missingConfig, "jobs", "wait", "--help"},
+			expected: "jobs wait JOB_ID [--timeout DURATION]",
 		},
 		"workspace register": {
 			args:     []string{"-config", missingConfig, "workspaces", "register", "--help"},
