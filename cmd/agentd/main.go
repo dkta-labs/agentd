@@ -634,6 +634,9 @@ func jobIsActive(job store.Job) bool {
 	if job.RunRequested || job.ActiveRunID != "" {
 		return true
 	}
+	if job.DesiredState == "running" && job.State == "scheduled" && job.CadenceSeconds > 0 && job.NextRunAt != nil && !job.NextRunAt.After(time.Now()) {
+		return true
+	}
 	switch job.State {
 	case "starting", "running", "stopping":
 		return true

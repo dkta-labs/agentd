@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,6 +133,216 @@ func TestAdminWaitActiveToTerminalIncludesLatestRun(t *testing.T) {
 	}
 	if jobGets.Load() < 2 {
 		t.Fatalf("job GET count = %d; want at least 2", jobGets.Load())
+	}
+}
+func TestAdminWaitDueScheduledBeforeClaim(t *testing.T) {
+	var jobGets, runGets atomic.Int32
+	due := time.Now().UTC().Add(-time.Second)
+	future := time.Now().UTC().Add(time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs/job-due":
+			switch jobGets.Add(1) {
+			case 1, 2:
+				_ = json.NewEncoder(w).Encode(store.Job{
+					ID: "job-due", DesiredState: "running", State: "scheduled", CadenceSeconds: 60, NextRunAt: &due,
+				})
+			case 3:
+				_ = json.NewEncoder(w).Encode(store.Job{
+					ID: "job-due", DesiredState: "running", State: "running", ActiveRunID: "run-due",
+				})
+			default:
+				_ = json.NewEncoder(w).Encode(store.Job{
+					ID: "job-due", DesiredState: "running", State: "scheduled", CadenceSeconds: 60, NextRunAt: &future,
+				})
+			}
+		case "/jobs/job-due/runs":
+			runGets.Add(1)
+			if r.URL.Query().Get("limit") != "1" {
+				t.Errorf("runs limit = %q", r.URL.Query().Get("limit"))
+			}
+			_ = json.NewEncoder(w).Encode([]store.Run{{
+				ID: "run-due", JobID: "job-due", State: "completed", ExitCode: new(0),
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{Listen: strings.TrimPrefix(server.URL, "http://")}
+	var output bytes.Buffer
+	if err := waitForJob(context.Background(), cfg, "job-due", time.Second, time.Millisecond, &output); err != nil {
+		t.Fatal(err)
+	}
+	var result jobWaitOutput
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Job.State != "scheduled" || result.Job.DesiredState != "running" || result.LatestRun == nil || result.LatestRun.ID != "run-due" {
+		t.Fatalf("wait result = %#v", result)
+	}
+	if jobGets.Load() < 4 {
+		t.Fatalf("job GET count = %d; want due observation, claim, and settlement", jobGets.Load())
+	}
+	if runGets.Load() != 1 {
+		t.Fatalf("run GET count = %d; want 1", runGets.Load())
+	}
+}
+func TestAdminWaitDueScheduledRespectsCollisionBoundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	workspacePath := t.TempDir()
+	if err := db.SeedWorkspace(ctx, config.Workspace{ID: "shared", Name: "shared", Path: workspacePath}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := db.CreateJob(ctx, store.Job{ID: "active", Name: "active", WorkspaceID: "shared", InvocationRequest: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.RequestRun(ctx, active.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	active, activeRun, claimed, err := db.ClaimNext(ctx, now, "run-active")
+	if err != nil || !claimed {
+		t.Fatalf("active claim = %#v, %v, %v", active, err, claimed)
+	}
+	due, err := db.CreateJob(ctx, store.Job{
+		ID: "due", Name: "due", WorkspaceID: "shared", InvocationRequest: "due", CadenceSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartJob(ctx, due.ID, now.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, claimed, err := db.ClaimNext(ctx, now, "run-blocked"); err != nil || claimed {
+		t.Fatalf("collision claim = claimed %v, err %v; want blocked", claimed, err)
+	}
+
+	var jobGets, runGets, mutating atomic.Int32
+	firstGet := make(chan struct{})
+	var firstGetOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			mutating.Add(1)
+		}
+		switch r.URL.Path {
+		case "/jobs/due":
+			job, err := db.Job(ctx, due.ID)
+			if err != nil {
+				t.Errorf("read due job: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(job)
+			jobGets.Add(1)
+			firstGetOnce.Do(func() { close(firstGet) })
+		case "/jobs/due/runs":
+			runGets.Add(1)
+			runs, err := db.Runs(ctx, due.ID, 1)
+			if err != nil {
+				t.Errorf("read due runs: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(runs)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{Listen: strings.TrimPrefix(server.URL, "http://")}
+	var output bytes.Buffer
+	waitResult := make(chan error, 1)
+	go func() {
+		waitResult <- waitForJob(ctx, cfg, due.ID, time.Second, time.Millisecond, &output)
+	}()
+	select {
+	case <-firstGet:
+	case <-time.After(time.Second):
+		t.Fatal("wait did not observe due scheduled job")
+	}
+	select {
+	case err := <-waitResult:
+		t.Fatalf("wait settled while collision was held: %v", err)
+	default:
+	}
+	if runGets.Load() != 0 {
+		t.Fatalf("run GET count before claim = %d; want 0", runGets.Load())
+	}
+
+	exitCode := 0
+	if _, err := db.FinishRun(ctx, active.ID, activeRun.ID, "completed", &exitCode, "", "", "", "", now, true); err != nil {
+		t.Fatal(err)
+	}
+	_, dueRun, claimed, err := db.ClaimNext(ctx, now, "run-due")
+	if err != nil || !claimed {
+		t.Fatalf("due claim after release = claimed %v, err %v", claimed, err)
+	}
+	if _, err := db.FinishRun(ctx, due.ID, dueRun.ID, "completed", &exitCode, "", "", "", "", now.Add(time.Second), true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waitResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not settle after collision release")
+	}
+	var result jobWaitOutput
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.LatestRun == nil || result.LatestRun.ID != dueRun.ID || result.Job.State != "scheduled" {
+		t.Fatalf("wait result = %#v", result)
+	}
+	if jobGets.Load() < 2 || runGets.Load() != 1 || mutating.Load() != 0 {
+		t.Fatalf("request counts = jobs %d, runs %d, mutating %d", jobGets.Load(), runGets.Load(), mutating.Load())
+	}
+}
+
+func TestAdminWaitFutureScheduledReturnsImmediately(t *testing.T) {
+	var jobGets, runGets atomic.Int32
+	future := time.Now().UTC().Add(time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/jobs/job-future":
+			jobGets.Add(1)
+			_ = json.NewEncoder(w).Encode(store.Job{
+				ID: "job-future", DesiredState: "running", State: "scheduled", NextRunAt: &future,
+			})
+		case "/jobs/job-future/runs":
+			runGets.Add(1)
+			_ = json.NewEncoder(w).Encode([]store.Run(nil))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{Listen: strings.TrimPrefix(server.URL, "http://")}
+	var output bytes.Buffer
+	if err := waitForJob(context.Background(), cfg, "job-future", time.Second, time.Hour, &output); err != nil {
+		t.Fatal(err)
+	}
+	if jobGets.Load() != 1 || runGets.Load() != 1 {
+		t.Fatalf("GET counts = job %d, runs %d; want 1 each", jobGets.Load(), runGets.Load())
+	}
+	var result jobWaitOutput
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Job.State != "scheduled" || result.LatestRun != nil {
+		t.Fatalf("wait result = %#v", result)
 	}
 }
 
