@@ -67,7 +67,10 @@ agentd -config agentd.json jobs create -name nightly -workspace agentd -request 
 agentd -config agentd.json jobs list
 agentd -config agentd.json jobs run <job-id>
 agentd -config agentd.json jobs runs <job-id>
+agentd -config agentd.json jobs wait <job-id> --timeout 30m
 ```
+
+`jobs wait` polls the loopback job and run APIs until requested or active work settles, then emits one JSON object containing the final `job` and `latestRun` evidence. `--timeout` leaves the managed run untouched and exits with status 124; Ctrl-C cancels only the waiting CLI process.
 
 `agentd top` is the read-only terminal visualization for the configured daemon. It refreshes a lifecycle-sorted jobs table with active run, Herdr owner, elapsed time, last/next run, and bounded failure detail. It performs only `GET` requests, fetches run details only for active jobs, and does not inspect transcripts or guess semantic percent complete. Piped output renders one snapshot automatically.
 
