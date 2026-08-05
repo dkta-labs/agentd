@@ -21,41 +21,29 @@ const MaxInvocationBytes = 64 * 1024
 type WorkspaceResolver interface {
 	Workspace(context.Context, string) (config.Workspace, error)
 }
-type VisibilityReporter interface {
-	Report(context.Context, config.Workspace, Visibility) error
-}
-type Visibility struct {
-	Status   string
-	JobID    string
-	JobName  string
-	RunID    string
-	Result   string
-	Evidence string
-}
 type CreateRequest struct {
 	Name              string `json:"name"`
 	WorkspaceID       string `json:"workspaceId"`
 	Runner            string `json:"runner"`
 	InvocationRequest string `json:"invocationRequest"`
 	CadenceSeconds    int    `json:"cadenceSeconds"`
+	GoalKey           string `json:"goalKey"`
 }
 
 type activeRun struct {
-	jobID         string
 	process       runner.Process
 	stopRequested bool
+	waitCancel    context.CancelFunc
 }
 
 type Supervisor struct {
 	store        *store.DB
 	workspaces   WorkspaceResolver
 	runners      runner.Resolver
-	reporter     VisibilityReporter
 	logger       *slog.Logger
 	wake         chan struct{}
 	mu           sync.Mutex
 	transitionMu sync.Mutex
-	visibilityMu sync.Mutex
 	active       map[string]activeRun
 	closing      bool
 	cancel       context.CancelFunc
@@ -71,28 +59,6 @@ func New(db *store.DB, workspaces WorkspaceResolver, runners runner.Resolver, lo
 		logger = slog.Default()
 	}
 	return &Supervisor{store: db, workspaces: workspaces, runners: runners, logger: logger, wake: make(chan struct{}, 1), active: make(map[string]activeRun)}, nil
-}
-func (s *Supervisor) SetVisibilityReporter(reporter VisibilityReporter) {
-	s.reporter = reporter
-}
-
-func (s *Supervisor) SyncVisibility(ctx context.Context) error {
-	jobs, err := s.store.Jobs(ctx)
-	if err != nil {
-		return err
-	}
-	seen := make(map[string]struct{}, len(jobs))
-	var first error
-	for _, job := range jobs {
-		if _, ok := seen[job.WorkspaceID]; ok {
-			continue
-		}
-		seen[job.WorkspaceID] = struct{}{}
-		if err := s.reportWorkspaceBounded(ctx, job.WorkspaceID); err != nil && first == nil {
-			first = err
-		}
-	}
-	return first
 }
 
 func (s *Supervisor) Start(parent context.Context) {
@@ -142,7 +108,7 @@ func (s *Supervisor) dispatch(ctx context.Context) {
 			return
 		}
 		s.mu.Lock()
-		s.active[run.ID] = activeRun{jobID: job.ID}
+		s.active[run.ID] = activeRun{}
 		s.mu.Unlock()
 		s.wg.Add(1)
 		go func() {
@@ -169,41 +135,133 @@ func (s *Supervisor) BeginClose() {
 func (s *Supervisor) Close(ctx context.Context) error {
 	s.BeginClose()
 	s.mu.Lock()
-	jobs := make([]string, 0, len(s.active))
+	cancels := make([]context.CancelFunc, 0, len(s.active))
 	for _, active := range s.active {
-		jobs = append(jobs, active.jobID)
+		if active.waitCancel != nil {
+			cancels = append(cancels, active.waitCancel)
+		}
 	}
 	s.mu.Unlock()
-	var first error
-	for _, jobID := range jobs {
-		var stopErr error
-		for {
-			_, stopErr = s.StopJob(ctx, jobID)
-			if stopErr == nil {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				break
-			case <-time.After(100 * time.Millisecond):
-				continue
-			}
-			break
-		}
-		if stopErr != nil && first == nil {
-			first = stopErr
-		}
+	for _, cancel := range cancels {
+		cancel()
 	}
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {
 	case <-done:
+		return nil
 	case <-ctx.Done():
-		if first == nil {
-			first = ctx.Err()
+		return ctx.Err()
+	}
+}
+
+// Recover reattaches background watchers to Herdr-owned interactive sessions.
+// Healthy workers survive Agentd restarts; only missing owners are interrupted.
+func (s *Supervisor) Recover(ctx context.Context) error {
+	jobs, err := s.store.Jobs(ctx)
+	if err != nil {
+		return err
+	}
+	var first error
+	for _, job := range jobs {
+		if job.ActiveRunID == "" {
+			continue
+		}
+		run, runErr := s.store.Run(ctx, job.ID, job.ActiveRunID)
+		if runErr != nil {
+			if first == nil {
+				first = runErr
+			}
+			continue
+		}
+		configured, resolveErr := s.runners.Runner(job.Runner)
+		workspace, workspaceErr := s.workspaces.Workspace(ctx, job.WorkspaceID)
+		if resolveErr != nil || workspaceErr != nil || run.ProcessReference == "" {
+			message := "cannot reattach Herdr owner after Agentd restart"
+			_, finishErr := s.store.FinishRun(ctx, job.ID, run.ID, "interrupted", nil, "", message, run.Stdout, run.Stderr, time.Now().UTC(), true)
+			if first == nil {
+				first = errors.Join(resolveErr, workspaceErr, finishErr)
+			}
+			continue
+		}
+		jobValue := runner.Job{
+			ID: job.ID, RunID: run.ID, WorkspaceID: job.WorkspaceID,
+			WorkspacePath: workspace.Path, GoalKey: job.GoalKey, InvocationRequest: job.InvocationRequest,
+		}
+		var process runner.Process
+		var prepared runner.Prepared
+		if run.State == "starting" {
+			reattacher, ok := configured.(runner.PreparedReattacher)
+			if !ok {
+				message := "cannot reattach prepared Herdr owner after Agentd restart"
+				_, finishErr := s.store.FinishRun(ctx, job.ID, run.ID, "interrupted", nil, "", message, run.Stdout, run.Stderr, time.Now().UTC(), true)
+				if first == nil {
+					first = finishErr
+				}
+				continue
+			}
+			prepared, runErr = reattacher.AttachPrepared(ctx, jobValue, run.ProcessReference, run.PreparedSequence)
+			if runErr == nil {
+				process = prepared.Process()
+			}
+		} else {
+			reattacher, ok := configured.(runner.Reattacher)
+			if !ok {
+				runErr = errors.New("runner does not support restart attachment")
+			} else {
+				process, runErr = reattacher.Attach(ctx, jobValue, run.ProcessReference)
+			}
+		}
+		if runErr != nil {
+			message := "reattach Herdr owner after Agentd restart: " + runErr.Error()
+			_, finishErr := s.store.FinishRun(ctx, job.ID, run.ID, "interrupted", nil, "", message, run.Stdout, run.Stderr, time.Now().UTC(), true)
+			if first == nil {
+				first = finishErr
+			}
+			continue
+		}
+		runCtx, cancel := context.WithCancel(context.Background())
+		s.mu.Lock()
+		s.active[run.ID] = activeRun{process: process, waitCancel: cancel}
+		s.mu.Unlock()
+		s.wg.Add(1)
+		if prepared != nil {
+			go func(job store.Job, run store.Run, process runner.Process, prepared runner.Prepared, runCtx context.Context, cancel context.CancelFunc) {
+				defer s.wg.Done()
+				defer cancel()
+				s.recoverPrepared(job, run, process, prepared, runCtx)
+			}(job, run, process, prepared, runCtx, cancel)
+		} else {
+			go func(job store.Job, run store.Run, process runner.Process, runCtx context.Context, cancel context.CancelFunc) {
+				defer s.wg.Done()
+				defer cancel()
+				s.watchProcess(job, run, process, runCtx, nil)
+			}(job, run, process, runCtx, cancel)
 		}
 	}
 	return first
+}
+
+func (s *Supervisor) recoverPrepared(job store.Job, run store.Run, process runner.Process, prepared runner.Prepared, runCtx context.Context) {
+	var stateErr error
+	if err := prepared.Dispatch(runCtx); err != nil {
+		stateErr = fmt.Errorf("dispatch assignment after restart: %w", err)
+	} else {
+		stateErr = s.store.SetRunRunning(context.Background(), job.ID, run.ID, executionReference(process), processReference(process))
+		if stateErr != nil {
+			stateErr = fmt.Errorf("record running state after restart: %w", stateErr)
+		}
+	}
+	if stateErr != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stopErr := process.Stop(stopCtx)
+		stopCancel()
+		if stopErr != nil {
+			stateErr = errors.Join(stateErr, fmt.Errorf("stop Herdr owner: %w", stopErr))
+			_ = s.store.SetStopFailure(context.Background(), job.ID, run.ID, stateErr.Error())
+		}
+	}
+	s.watchProcess(job, run, process, runCtx, stateErr)
 }
 
 func (s *Supervisor) Create(ctx context.Context, request CreateRequest) (store.Job, error) {
@@ -215,7 +273,7 @@ func (s *Supervisor) Create(ctx context.Context, request CreateRequest) (store.J
 	if err != nil {
 		return store.Job{}, err
 	}
-	return s.store.CreateJob(ctx, store.Job{ID: id, Name: definition.Name, WorkspaceID: definition.WorkspaceID, Runner: definition.Runner, InvocationRequest: definition.InvocationRequest, CadenceSeconds: definition.CadenceSeconds})
+	return s.store.CreateJob(ctx, store.Job{ID: id, Name: definition.Name, WorkspaceID: definition.WorkspaceID, GoalKey: definition.GoalKey, Runner: definition.Runner, InvocationRequest: definition.InvocationRequest, CadenceSeconds: definition.CadenceSeconds})
 }
 func (s *Supervisor) Update(ctx context.Context, id string, request CreateRequest) (store.Job, error) {
 	definition, err := s.validate(ctx, request)
@@ -284,9 +342,11 @@ func (s *Supervisor) StopJob(ctx context.Context, id string) (store.Job, error) 
 	}
 	s.mu.Lock()
 	active, owned := s.active[j.ActiveRunID]
-	if owned && active.process == nil {
+	if owned {
 		active.stopRequested = true
 		s.active[j.ActiveRunID] = active
+	}
+	if owned && active.process == nil {
 		s.mu.Unlock()
 		return j, nil
 	}
@@ -318,6 +378,10 @@ func (s *Supervisor) validate(ctx context.Context, request CreateRequest) (store
 		request.Runner = "omp"
 	}
 	request.InvocationRequest = strings.TrimSpace(request.InvocationRequest)
+	request.GoalKey = strings.TrimSpace(request.GoalKey)
+	if request.GoalKey != "" && len(request.GoalKey) > 120 {
+		return store.Job{}, errors.New("goalKey must not exceed 120 bytes")
+	}
 	if request.Name == "" || len(request.Name) > 120 {
 		return store.Job{}, errors.New("name must contain between 1 and 120 bytes")
 	}
@@ -336,68 +400,109 @@ func (s *Supervisor) validate(ctx context.Context, request CreateRequest) (store
 	if _, err := s.runners.Runner(request.Runner); err != nil {
 		return store.Job{}, err
 	}
-	return store.Job{Name: request.Name, WorkspaceID: request.WorkspaceID, Runner: request.Runner, InvocationRequest: request.InvocationRequest, CadenceSeconds: request.CadenceSeconds}, nil
+	return store.Job{Name: request.Name, WorkspaceID: request.WorkspaceID, GoalKey: request.GoalKey, Runner: request.Runner, InvocationRequest: request.InvocationRequest, CadenceSeconds: request.CadenceSeconds}, nil
 }
 
-func (s *Supervisor) startRun(job store.Job, run store.Run) (runner.Process, error) {
-	workspace, err := s.workspaces.Workspace(context.Background(), job.WorkspaceID)
+func (s *Supervisor) startRun(ctx context.Context, job store.Job, run store.Run) (runner.Process, func(context.Context) error, uint64, bool, error) {
+	workspace, err := s.workspaces.Workspace(ctx, job.WorkspaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, false, err
 	}
 	configured, err := s.runners.Runner(job.Runner)
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, false, err
 	}
-	process, err := configured.Start(context.Background(), runner.Job{ID: job.ID, RunID: run.ID, WorkspacePath: workspace.Path, InvocationRequest: job.InvocationRequest})
-	if err != nil {
-		return nil, err
+	jobValue := runner.Job{
+		ID: job.ID, RunID: run.ID, WorkspaceID: job.WorkspaceID,
+		WorkspacePath: workspace.Path, GoalKey: job.GoalKey, InvocationRequest: job.InvocationRequest,
 	}
-	return process, nil
+	if preparer, ok := configured.(runner.Preparer); ok {
+		prepared, err := preparer.Prepare(ctx, jobValue)
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		return prepared.Process(), prepared.Dispatch, preparedSequence(prepared.Process()), true, nil
+	}
+	process, err := configured.Start(ctx, jobValue)
+	return process, nil, 0, false, err
 }
 
 func (s *Supervisor) execute(job store.Job, run store.Run) {
-	defer func() {
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.mu.Lock()
+	active := s.active[run.ID]
+	active.waitCancel = cancel
+	s.active[run.ID] = active
+	s.mu.Unlock()
+
+	process, dispatch, prePromptSequence, prepared, startErr := s.startRun(runCtx, job, run)
+	if startErr != nil {
 		s.mu.Lock()
+		closing := s.closing
 		delete(s.active, run.ID)
 		s.mu.Unlock()
-	}()
-	s.reportWorkspaceLogged(job.WorkspaceID)
-
-	process, startErr := s.startRun(job, run)
-	if startErr != nil {
+		if closing && errors.Is(startErr, context.Canceled) {
+			return
+		}
 		_, _ = s.store.FinishRun(context.Background(), job.ID, run.ID, "failed", nil, "", startErr.Error(), "", "", time.Now().UTC(), true)
-		s.reportWorkspaceLogged(job.WorkspaceID)
 		s.notify()
 		return
 	}
 	s.mu.Lock()
-	active := s.active[run.ID]
+	active = s.active[run.ID]
 	active.process = process
 	stopRequested := active.stopRequested
 	s.active[run.ID] = active
 	s.mu.Unlock()
 
-	stateErr := s.store.SetRunRunning(context.Background(), job.ID, run.ID, executionReference(process), processReference(process))
-	s.reportWorkspaceLogged(job.WorkspaceID)
-	if stopRequested || stateErr != nil {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		stopErr := process.Stop(stopCtx)
-		cancel()
-		if stopErr != nil {
-			if stopRequested {
-				stateErr = fmt.Errorf("stop requested before process registration: %w", stopErr)
-			} else {
-				stateErr = fmt.Errorf("stop after state persistence failure: %w", stopErr)
+	var stateErr error
+	if prepared {
+		stateErr = s.store.SetRunPreparedEvidence(context.Background(), job.ID, run.ID, executionReference(process), processReference(process), prePromptSequence)
+		if stateErr == nil && !stopRequested && dispatch != nil {
+			if dispatchErr := dispatch(runCtx); dispatchErr != nil {
+				stateErr = fmt.Errorf("dispatch assignment: %w", dispatchErr)
 			}
+		}
+		if stateErr == nil && !stopRequested {
+			stateErr = s.store.SetRunRunning(context.Background(), job.ID, run.ID, executionReference(process), processReference(process))
+		}
+	} else {
+		stateErr = s.store.SetRunRunning(context.Background(), job.ID, run.ID, executionReference(process), processReference(process))
+	}
+	if stateErr != nil {
+		stateErr = fmt.Errorf("record run state: %w", stateErr)
+	}
+	shouldStop := stopRequested || stateErr != nil
+	if shouldStop {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stopErr := process.Stop(stopCtx)
+		stopCancel()
+		if stopErr != nil {
+			stateErr = errors.Join(stateErr, fmt.Errorf("stop Herdr owner: %w", stopErr))
 			_ = s.store.SetStopFailure(context.Background(), job.ID, run.ID, stateErr.Error())
 		}
 	}
+	s.watchProcess(job, run, process, runCtx, stateErr)
+}
 
-	exit, waitErr := process.Wait(context.Background())
+func (s *Supervisor) watchProcess(job store.Job, run store.Run, process runner.Process, runCtx context.Context, stateErr error) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.active, run.ID)
+		s.mu.Unlock()
+	}()
+	exit, waitErr := process.Wait(runCtx)
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing && errors.Is(waitErr, context.Canceled) {
+		return
+	}
 	stdout, stderr := output(process)
 	state, message := "completed", ""
 	if stateErr != nil {
-		state, message = "failed", "record running state: "+stateErr.Error()
+		state, message = "failed", stateErr.Error()
 	} else if waitErr != nil {
 		state, message = "failed", waitErr.Error()
 	} else if !exit.Successful() {
@@ -418,99 +523,13 @@ func (s *Supervisor) execute(job store.Job, run store.Run) {
 	if _, err := s.store.FinishRun(context.Background(), job.ID, run.ID, state, exitCode, exit.Signal, message, stdout, stderr, time.Now().UTC(), true); err != nil {
 		s.logger.Error("finish run", "job", job.ID, "run", run.ID, "error", err)
 	}
-	s.reportWorkspaceLogged(job.WorkspaceID)
 	s.notify()
 }
-func (s *Supervisor) reportWorkspaceLogged(workspaceID string) {
-	if err := s.reportWorkspaceBounded(context.Background(), workspaceID); err != nil {
-		s.logger.Warn("report workspace visibility", "workspace", workspaceID, "error", err)
+func preparedSequence(p runner.Process) uint64 {
+	if evidence, ok := p.(runner.PreparedEvidence); ok {
+		return evidence.PreparedSequence()
 	}
-}
-func (s *Supervisor) reportWorkspaceBounded(parent context.Context, workspaceID string) error {
-	if s.reporter == nil {
-		return nil
-	}
-	s.visibilityMu.Lock()
-	defer s.visibilityMu.Unlock()
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-	defer cancel()
-	return s.reportWorkspaceLocked(ctx, workspaceID)
-}
-func (s *Supervisor) reportWorkspace(ctx context.Context, workspaceID string) error {
-	if s.reporter == nil {
-		return nil
-	}
-	s.visibilityMu.Lock()
-	defer s.visibilityMu.Unlock()
-	return s.reportWorkspaceLocked(ctx, workspaceID)
-}
-func (s *Supervisor) reportWorkspaceLocked(ctx context.Context, workspaceID string) error {
-	workspace, err := s.workspaces.Workspace(ctx, workspaceID)
-	if err != nil {
-		return err
-	}
-	jobs, err := s.store.Jobs(ctx)
-	if err != nil {
-		return err
-	}
-	var selected *store.Job
-	for i := range jobs {
-		job := &jobs[i]
-		if job.WorkspaceID != workspaceID {
-			continue
-		}
-		if selected == nil || visibilityRank(*job) > visibilityRank(*selected) || (visibilityRank(*job) == visibilityRank(*selected) && job.UpdatedAt.After(selected.UpdatedAt)) {
-			selected = job
-		}
-	}
-	if selected == nil {
-		return nil
-	}
-	status := "idle"
-	if visibilityRank(*selected) == 3 {
-		status = "working"
-	} else if visibilityRank(*selected) == 2 {
-		status = "blocked"
-	}
-	visibility := Visibility{Status: status, JobID: selected.ID, JobName: selected.Name, RunID: selected.ActiveRunID, Result: selected.State}
-	runs, runErr := s.store.Runs(ctx, selected.ID, 1)
-	if runErr != nil {
-		return runErr
-	}
-	if len(runs) > 0 {
-		if visibility.RunID == "" {
-			visibility.RunID = runs[0].ID
-		}
-		visibility.Evidence = runs[0].ExecutionReference
-		if status == "idle" {
-			visibility.Result = runs[0].State
-		}
-	}
-	if status == "blocked" && selected.LastError != "" {
-		visibility.Result = selected.LastError
-	}
-	visibility.Result = truncateVisibility(visibility.Result, 120)
-	return s.reporter.Report(ctx, workspace, visibility)
-}
-func visibilityRank(job store.Job) int {
-	switch job.State {
-	case "starting", "running", "stopping":
-		return 3
-	case "failed", "interrupted":
-		return 2
-	default:
-		if job.LastError != "" {
-			return 2
-		}
-		return 1
-	}
-}
-func truncateVisibility(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= limit {
-		return value
-	}
-	return value[:limit-3] + "..."
+	return 0
 }
 func executionReference(p runner.Process) string {
 	if e, ok := p.(runner.Evidence); ok {

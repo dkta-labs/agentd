@@ -30,6 +30,7 @@ type Job struct {
 	ID                string     `json:"id"`
 	Name              string     `json:"name"`
 	WorkspaceID       string     `json:"workspaceId"`
+	GoalKey           string     `json:"goalKey"`
 	Runner            string     `json:"runner"`
 	InvocationRequest string     `json:"invocationRequest"`
 	CadenceSeconds    int        `json:"cadenceSeconds"`
@@ -38,6 +39,7 @@ type Job struct {
 	Iteration         int64      `json:"iteration"`
 	RunRequested      bool       `json:"runRequested"`
 	ActiveRunID       string     `json:"activeRunId,omitempty"`
+	OwnerTarget       string     `json:"ownerTarget,omitempty"`
 	NextRunAt         *time.Time `json:"nextRunAt,omitempty"`
 	LastRunAt         *time.Time `json:"lastRunAt,omitempty"`
 	LastError         string     `json:"lastError,omitempty"`
@@ -52,6 +54,7 @@ type Run struct {
 	Runner             string     `json:"runner"`
 	ExecutionReference string     `json:"executionReference,omitempty"`
 	ProcessReference   string     `json:"processReference,omitempty"`
+	PreparedSequence   uint64     `json:"preparedSequence,omitempty"`
 	State              string     `json:"state"`
 	ExitCode           *int       `json:"exitCode,omitempty"`
 	ExitSignal         string     `json:"exitSignal,omitempty"`
@@ -166,6 +169,7 @@ func (s *DB) migrate(ctx context.Context) error {
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
+            goal_key TEXT NOT NULL DEFAULT '',
             runner TEXT NOT NULL DEFAULT 'omp',
             invocation_request TEXT NOT NULL,
             cadence_seconds INTEGER NOT NULL DEFAULT 0,
@@ -174,19 +178,21 @@ func (s *DB) migrate(ctx context.Context) error {
             iteration INTEGER NOT NULL DEFAULT 0,
             run_requested INTEGER NOT NULL DEFAULT 0,
             active_run_id TEXT NOT NULL DEFAULT '',
+            active_owner_target TEXT NOT NULL DEFAULT '',
             next_run_at TEXT,
             last_run_at TEXT,
             last_error TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS runs (
+		CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY,
             job_id TEXT NOT NULL,
             iteration INTEGER NOT NULL,
             runner TEXT NOT NULL DEFAULT 'omp',
             execution_reference TEXT NOT NULL DEFAULT '',
             process_reference TEXT NOT NULL DEFAULT '',
+            prepared_sequence INTEGER NOT NULL DEFAULT 0,
             state TEXT NOT NULL,
             exit_code INTEGER,
             exit_signal TEXT NOT NULL DEFAULT '',
@@ -202,6 +208,15 @@ func (s *DB) migrate(ctx context.Context) error {
         CREATE INDEX IF NOT EXISTS runs_job_iteration ON runs(job_id, iteration DESC);
     `); err != nil {
 		return fmt.Errorf("create job/run schema: %w", err)
+	}
+	if err := ensureColumn(ctx, tx, "jobs", "active_owner_target", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, tx, "jobs", "goal_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, tx, "runs", "prepared_sequence", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
 	}
 	if err := migrateLegacy(ctx, tx); err != nil {
 		return err
@@ -236,6 +251,20 @@ func columns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, er
 	}
 	return result, rows.Err()
 }
+
+func ensureColumn(ctx context.Context, tx *sql.Tx, table, name, definition string) error {
+	available, err := columns(ctx, tx, table)
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	if available[name] {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+name+` `+definition); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, name, err)
+	}
+	return nil
+}
 func col(expr string, available map[string]bool, fallback string) string {
 	if available[expr] {
 		return expr
@@ -269,8 +298,8 @@ func migrateLegacy(ctx context.Context, tx *sql.Tx) error {
 	}
 	defaults := func(name, fallback string) string { return col(name, c, fallback) }
 	query := fmt.Sprintf(`INSERT OR IGNORE INTO jobs(
-            id,name,workspace_id,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,next_run_at,last_run_at,last_error,created_at,updated_at)
-        SELECT id,name,workspace_id,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s FROM crons`, runner, invocation,
+            id,name,workspace_id,goal_key,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,next_run_at,last_run_at,last_error,created_at,updated_at)
+        SELECT id,name,workspace_id,'',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s FROM crons`, runner, invocation,
 		defaults("cadence_seconds", "0"), defaults("desired_state", "'paused'"), defaults("state", "'paused'"), defaults("iteration", "0"), defaults("run_requested", "0"), defaults("active_run_id", "''"), defaults("next_run_at", "NULL"), defaults("last_run_at", "NULL"), defaults("last_error", "''"), defaults("created_at", "CURRENT_TIMESTAMP"), defaults("updated_at", "CURRENT_TIMESTAMP"))
 	if _, err := tx.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("migrate crons to jobs: %w", err)
@@ -317,25 +346,6 @@ func dropLegacy(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func (s *DB) RecoverInterrupted(ctx context.Context, now time.Time) error {
-	stamp := encodeTime(now)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin restart recovery: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET state='interrupted', error=CASE WHEN error='' THEN 'agentd restarted during active run' ELSE error END, finished_at=? WHERE finished_at IS NULL AND state IN ('starting','running','stopping')`, stamp); err != nil {
-		return fmt.Errorf("interrupt active runs: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET desired_state='paused', state='interrupted', active_run_id='', run_requested=0, next_run_at=NULL, last_error=CASE WHEN last_error='' THEN 'agentd restarted during active run' ELSE last_error END, updated_at=? WHERE active_run_id <> '' OR state IN ('starting','running','stopping')`, stamp); err != nil {
-		return fmt.Errorf("interrupt active jobs: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit restart recovery: %w", err)
-	}
-	return nil
-}
-
 func encodeTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 func encodeOptionalTime(t *time.Time) any {
 	if t == nil {
@@ -352,13 +362,14 @@ func decodeOptionalTime(value sql.NullString) *time.Time {
 	return &t
 }
 
-const jobColumns = `id,name,workspace_id,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,next_run_at,last_run_at,last_error,created_at,updated_at`
+const jobColumns = `id,name,workspace_id,goal_key,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,active_owner_target,next_run_at,last_run_at,last_error,created_at,updated_at`
+const runColumns = `id,job_id,iteration,runner,execution_reference,process_reference,prepared_sequence,state,exit_code,exit_signal,error,stdout,stderr,started_at,finished_at`
 
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	var next, last sql.NullString
 	var created, updated string
-	err := row.Scan(&j.ID, &j.Name, &j.WorkspaceID, &j.Runner, &j.InvocationRequest, &j.CadenceSeconds, &j.DesiredState, &j.State, &j.Iteration, &j.RunRequested, &j.ActiveRunID, &next, &last, &j.LastError, &created, &updated)
+	err := row.Scan(&j.ID, &j.Name, &j.WorkspaceID, &j.GoalKey, &j.Runner, &j.InvocationRequest, &j.CadenceSeconds, &j.DesiredState, &j.State, &j.Iteration, &j.RunRequested, &j.ActiveRunID, &j.OwnerTarget, &next, &last, &j.LastError, &created, &updated)
 	j.NextRunAt = decodeOptionalTime(next)
 	j.LastRunAt = decodeOptionalTime(last)
 	j.CreatedAt = decodeTime(created)
@@ -401,7 +412,7 @@ func (s *DB) CreateJob(ctx context.Context, j Job) (Job, error) {
 	if j.Runner == "" {
 		j.Runner = "omp"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id,name,workspace_id,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,next_run_at,last_run_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, j.ID, j.Name, j.WorkspaceID, j.Runner, j.InvocationRequest, j.CadenceSeconds, j.DesiredState, j.State, j.Iteration, j.RunRequested, j.ActiveRunID, encodeOptionalTime(j.NextRunAt), encodeOptionalTime(j.LastRunAt), j.LastError, encodeTime(j.CreatedAt), encodeTime(j.UpdatedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id,name,workspace_id,goal_key,runner,invocation_request,cadence_seconds,desired_state,state,iteration,run_requested,active_run_id,next_run_at,last_run_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, j.ID, j.Name, j.WorkspaceID, j.GoalKey, j.Runner, j.InvocationRequest, j.CadenceSeconds, j.DesiredState, j.State, j.Iteration, j.RunRequested, j.ActiveRunID, encodeOptionalTime(j.NextRunAt), encodeOptionalTime(j.LastRunAt), j.LastError, encodeTime(j.CreatedAt), encodeTime(j.UpdatedAt))
 	if err != nil {
 		return Job{}, fmt.Errorf("insert job: %w", err)
 	}
@@ -409,7 +420,7 @@ func (s *DB) CreateJob(ctx context.Context, j Job) (Job, error) {
 }
 func (s *DB) UpdateJob(ctx context.Context, j Job) (Job, error) {
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET name=?,workspace_id=?,runner=?,invocation_request=?,cadence_seconds=?,updated_at=? WHERE id=? AND state NOT IN ('starting','running','stopping')`, j.Name, j.WorkspaceID, j.Runner, j.InvocationRequest, j.CadenceSeconds, encodeTime(now), j.ID)
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET name=?,workspace_id=?,goal_key=?,runner=?,invocation_request=?,cadence_seconds=?,updated_at=? WHERE id=? AND state NOT IN ('starting','running','stopping')`, j.Name, j.WorkspaceID, j.GoalKey, j.Runner, j.InvocationRequest, j.CadenceSeconds, encodeTime(now), j.ID)
 	if err != nil {
 		return Job{}, err
 	}
@@ -493,7 +504,7 @@ func (s *DB) ClaimNext(ctx context.Context, now time.Time, runID string) (Job, R
 	}
 	defer tx.Rollback()
 	now = now.UTC()
-	j, e := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE state='scheduled' AND (run_requested=1 OR (desired_state='running' AND cadence_seconds>0 AND next_run_at IS NOT NULL AND next_run_at<=?)) AND active_run_id='' ORDER BY run_requested DESC,next_run_at,created_at LIMIT 1`, encodeTime(now)))
+	j, e := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs AS candidate WHERE candidate.state='scheduled' AND (candidate.run_requested=1 OR (candidate.desired_state='running' AND candidate.cadence_seconds>0 AND candidate.next_run_at IS NOT NULL AND candidate.next_run_at<=?)) AND candidate.active_run_id='' AND NOT EXISTS (SELECT 1 FROM jobs AS active WHERE active.active_run_id<>'' AND ((candidate.goal_key<>'' AND active.goal_key=candidate.goal_key) OR active.workspace_id=candidate.workspace_id OR ((SELECT path FROM workspaces WHERE id=candidate.workspace_id) IS NOT NULL AND (SELECT path FROM workspaces WHERE id=active.workspace_id) IS NOT NULL AND (SELECT path FROM workspaces WHERE id=candidate.workspace_id)=(SELECT path FROM workspaces WHERE id=active.workspace_id)))) ORDER BY candidate.run_requested DESC,candidate.next_run_at,candidate.created_at LIMIT 1`, encodeTime(now)))
 	if errors.Is(e, sql.ErrNoRows) {
 		return Job{}, Run{}, false, nil
 	}
@@ -501,7 +512,7 @@ func (s *DB) ClaimNext(ctx context.Context, now time.Time, runID string) (Job, R
 		return Job{}, Run{}, false, e
 	}
 	iteration := j.Iteration + 1
-	res, e := tx.ExecContext(ctx, `UPDATE jobs SET state='starting',iteration=?,run_requested=0,active_run_id=?,last_run_at=?,updated_at=? WHERE id=? AND state='scheduled' AND active_run_id=''`, iteration, runID, encodeTime(now), encodeTime(now), j.ID)
+	res, e := tx.ExecContext(ctx, `UPDATE jobs AS candidate SET state='starting',iteration=?,run_requested=0,active_run_id=?,active_owner_target='',last_run_at=?,updated_at=? WHERE candidate.id=? AND candidate.state='scheduled' AND candidate.active_run_id='' AND NOT EXISTS (SELECT 1 FROM jobs AS active LEFT JOIN workspaces AS active_workspace ON active_workspace.id=active.workspace_id LEFT JOIN workspaces AS candidate_workspace ON candidate_workspace.id=candidate.workspace_id WHERE active.active_run_id<>'' AND ((candidate.goal_key<>'' AND active.goal_key=candidate.goal_key) OR active.workspace_id=candidate.workspace_id OR (candidate_workspace.id IS NOT NULL AND active_workspace.id IS NOT NULL AND candidate_workspace.path=active_workspace.path)))`, iteration, runID, encodeTime(now), encodeTime(now), j.ID)
 	if e != nil {
 		return Job{}, Run{}, false, e
 	}
@@ -524,6 +535,38 @@ func (s *DB) ClaimNext(ctx context.Context, now time.Time, runID string) (Job, R
 	j.UpdatedAt = now
 	return j, r, true, nil
 }
+func (s *DB) SetRunPreparedEvidence(ctx context.Context, jobID, runID, execution, process string, sequence uint64) error {
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	res, e := tx.ExecContext(ctx, `UPDATE runs SET execution_reference=?,process_reference=?,prepared_sequence=? WHERE id=? AND job_id=?`, execution, process, sequence, runID, jobID)
+	if e != nil {
+		return e
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	res, e = tx.ExecContext(ctx, `UPDATE jobs SET active_owner_target=?,updated_at=? WHERE id=? AND active_run_id=?`, process, encodeTime(time.Now().UTC()), jobID, runID)
+	if e != nil {
+		return e
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	var state string
+	if e = tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id=? AND active_run_id=?`, jobID, runID).Scan(&state); e != nil {
+		return e
+	}
+	if state == "stopping" {
+		if e = tx.Commit(); e != nil {
+			return e
+		}
+		return ErrStopping
+	}
+	return tx.Commit()
+}
 
 func (s *DB) SetRunRunning(ctx context.Context, jobID, runID, execution, process string) error {
 	tx, e := s.db.BeginTx(ctx, nil)
@@ -538,7 +581,7 @@ func (s *DB) SetRunRunning(ctx context.Context, jobID, runID, execution, process
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
 	}
-	res, e = tx.ExecContext(ctx, `UPDATE jobs SET state='running',updated_at=? WHERE id=? AND active_run_id=? AND state<>'stopping'`, encodeTime(time.Now().UTC()), jobID, runID)
+	res, e = tx.ExecContext(ctx, `UPDATE jobs SET state='running',active_owner_target=?,updated_at=? WHERE id=? AND active_run_id=? AND state<>'stopping'`, process, encodeTime(time.Now().UTC()), jobID, runID)
 	if e != nil {
 		return e
 	}
@@ -617,7 +660,7 @@ func (s *DB) FinishRun(ctx context.Context, jobID, runID, state string, exitCode
 			jobState = "paused"
 		}
 	}
-	if _, e = tx.ExecContext(ctx, `UPDATE jobs SET desired_state=?,state=?,active_run_id='',next_run_at=?,last_error=?,updated_at=? WHERE id=? AND active_run_id=?`, desired, jobState, encodeOptionalTime(next), message, encodeTime(finished), jobID, runID); e != nil {
+	if _, e = tx.ExecContext(ctx, `UPDATE jobs SET desired_state=?,state=?,active_run_id='',active_owner_target='',next_run_at=?,last_error=?,updated_at=? WHERE id=? AND active_run_id=?`, desired, jobState, encodeOptionalTime(next), message, encodeTime(finished), jobID, runID); e != nil {
 		return Job{}, e
 	}
 	if e = tx.Commit(); e != nil {
@@ -626,6 +669,7 @@ func (s *DB) FinishRun(ctx context.Context, jobID, runID, state string, exitCode
 	j.DesiredState = desired
 	j.State = jobState
 	j.ActiveRunID = ""
+	j.OwnerTarget = ""
 	j.NextRunAt = next
 	j.LastError = message
 	j.UpdatedAt = finished
@@ -635,7 +679,7 @@ func (s *DB) Runs(ctx context.Context, jobID string, limit int) ([]Run, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, e := s.db.QueryContext(ctx, `SELECT id,job_id,iteration,runner,execution_reference,process_reference,state,exit_code,exit_signal,error,stdout,stderr,started_at,finished_at FROM runs WHERE job_id=? ORDER BY iteration DESC LIMIT ?`, jobID, limit)
+	rows, e := s.db.QueryContext(ctx, `SELECT `+runColumns+` FROM runs WHERE job_id=? ORDER BY iteration DESC LIMIT ?`, jobID, limit)
 	if e != nil {
 		return nil, e
 	}
@@ -650,12 +694,15 @@ func (s *DB) Runs(ctx context.Context, jobID string, limit int) ([]Run, error) {
 	}
 	return out, rows.Err()
 }
+func (s *DB) Run(ctx context.Context, jobID, runID string) (Run, error) {
+	return scanRun(s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id=? AND job_id=?`, runID, jobID))
+}
 func scanRun(row rowScanner) (Run, error) {
 	var r Run
 	var exit sql.NullInt64
 	var finish sql.NullString
 	var started string
-	e := row.Scan(&r.ID, &r.JobID, &r.Iteration, &r.Runner, &r.ExecutionReference, &r.ProcessReference, &r.State, &exit, &r.ExitSignal, &r.Error, &r.Stdout, &r.Stderr, &started, &finish)
+	e := row.Scan(&r.ID, &r.JobID, &r.Iteration, &r.Runner, &r.ExecutionReference, &r.ProcessReference, &r.PreparedSequence, &r.State, &exit, &r.ExitSignal, &r.Error, &r.Stdout, &r.Stderr, &started, &finish)
 	if exit.Valid {
 		v := int(exit.Int64)
 		r.ExitCode = &v

@@ -13,13 +13,20 @@ import (
 	"github.com/dkta-labs/agentd/internal/supervisor"
 )
 
-type stubService struct{ stopped string }
-
-func (*stubService) Create(context.Context, supervisor.CreateRequest) (store.Job, error) {
-	return store.Job{}, errors.New("not implemented")
+type stubService struct {
+	stopped   string
+	created   supervisor.CreateRequest
+	updated   supervisor.CreateRequest
+	updatedID string
 }
-func (*stubService) Update(context.Context, string, supervisor.CreateRequest) (store.Job, error) {
-	return store.Job{}, errors.New("not implemented")
+
+func (s *stubService) Create(_ context.Context, request supervisor.CreateRequest) (store.Job, error) {
+	s.created = request
+	return store.Job{ID: "created", GoalKey: request.GoalKey}, nil
+}
+func (s *stubService) Update(_ context.Context, id string, request supervisor.CreateRequest) (store.Job, error) {
+	s.updatedID, s.updated = id, request
+	return store.Job{ID: id, GoalKey: request.GoalKey}, nil
 }
 func (*stubService) List(context.Context) ([]store.Job, error) { return []store.Job{}, nil }
 func (*stubService) Get(context.Context, string) (store.Job, error) {
@@ -89,12 +96,50 @@ func TestToolCallRoutesStopAndReturnsTextContent(t *testing.T) {
 	}
 	result := response["result"].(map[string]any)
 	if result["isError"] != false {
+
 		t.Fatalf("tool result = %#v", result)
 	}
 	content := result["content"].([]any)
 	if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
 		t.Fatalf("content = %#v", content)
 	}
+}
+func TestJobToolsThreadGoalKeyAndExposeSchema(t *testing.T) {
+	service := &stubService{}
+	server := New(service)
+	response := invoke(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentd_job_create","arguments":{"name":"job","workspaceId":"workspace","invocationRequest":"do work","goalKey":"goal-42"}}}`)
+	if service.created.GoalKey != "goal-42" {
+		t.Fatalf("created goal key = %q", service.created.GoalKey)
+	}
+	response = invoke(t, server, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentd_job_update","arguments":{"id":"job-1","name":"job","workspaceId":"workspace","invocationRequest":"do work","goalKey":"goal-43"}}}`)
+	if service.updatedID != "job-1" || service.updated.GoalKey != "goal-43" {
+		t.Fatalf("updated request = %#v, id = %q", service.updated, service.updatedID)
+	}
+	listed := invoke(t, server, `{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`)
+	for _, raw := range listed["result"].(map[string]any)["tools"].([]any) {
+		definition := raw.(map[string]any)
+		if definition["name"] != "agentd_job_create" && definition["name"] != "agentd_job_update" {
+			continue
+		}
+		schema := definition["inputSchema"].(map[string]any)
+		properties := schema["properties"].(map[string]any)
+		goalKey := properties["goalKey"].(map[string]any)
+		if goalKey["type"] != "string" {
+			t.Fatalf("goalKey schema = %#v", goalKey)
+		}
+		if _, advertised := goalKey["maxLength"]; advertised {
+			t.Fatalf("goalKey schema advertises maxLength = %#v", goalKey["maxLength"])
+		}
+		if schema["additionalProperties"] != false {
+			t.Fatalf("schema additionalProperties = %#v", schema["additionalProperties"])
+		}
+		for _, required := range schema["required"].([]any) {
+			if required == "goalKey" {
+				t.Fatal("goalKey must remain optional")
+			}
+		}
+	}
+	_ = response
 }
 
 func TestHostileOriginIsRejectedBeforeToolDispatch(t *testing.T) {

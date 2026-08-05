@@ -14,13 +14,13 @@ import (
 const DefaultListenAddress = "127.0.0.1:7337"
 
 type Config struct {
-	Listen      string            `json:"listen"`
-	DataDir     string            `json:"dataDir"`
-	OMPBinary   string            `json:"ompBinary"`
-	OMPArgs     []string          `json:"ompArgs"`
-	OMPEnvFiles map[string]string `json:"ompEnvFiles"`
-	HerdrBinary string            `json:"herdrBinary"`
-	Workspaces  []Workspace       `json:"workspaces"`
+	Listen            string            `json:"listen"`
+	DataDir           string            `json:"dataDir"`
+	HerdrBinary       string            `json:"herdrBinary"`
+	AgentArgs         []string          `json:"agentArgs"`
+	AgentEnv          map[string]string `json:"agentEnv"`
+	CoordinatorTarget string            `json:"coordinatorTarget"`
+	Workspaces        []Workspace       `json:"workspaces"`
 }
 
 type Workspace struct {
@@ -30,7 +30,7 @@ type Workspace struct {
 }
 
 func Load(path string) (Config, error) {
-	cfg := Config{Listen: DefaultListenAddress, OMPBinary: "omp", HerdrBinary: "herdr"}
+	cfg := Config{Listen: DefaultListenAddress, HerdrBinary: "herdr"}
 	configDir := "."
 	if path != "" {
 		file, err := os.Open(path)
@@ -89,46 +89,36 @@ func (cfg *Config) normalize(baseDir string) error {
 			return errors.New("listen address must be loopback-only")
 		}
 	}
-	cfg.OMPBinary = strings.TrimSpace(cfg.OMPBinary)
-	if cfg.OMPBinary == "" {
-		cfg.OMPBinary = "omp"
-	}
 	cfg.HerdrBinary = strings.TrimSpace(cfg.HerdrBinary)
 	if cfg.HerdrBinary == "" {
 		cfg.HerdrBinary = "herdr"
 	}
-	for i, arg := range cfg.OMPArgs {
+	for i, arg := range cfg.AgentArgs {
 		arg = strings.TrimSpace(arg)
 		if arg == "" {
-			return fmt.Errorf("ompArgs[%d] must not be empty", i)
+			return fmt.Errorf("agentArgs[%d] must not be empty", i)
 		}
-		if reservedOMPArg(arg) {
-			return fmt.Errorf("ompArgs[%d] conflicts with agentd-owned OMP lifecycle arguments", i)
+		if reservedAgentArg(arg) {
+			return fmt.Errorf("agentArgs[%d] conflicts with Agentd-owned interactive session arguments", i)
 		}
-		cfg.OMPArgs[i] = arg
+		cfg.AgentArgs[i] = arg
 	}
-	normalizedEnvFiles := make(map[string]string, len(cfg.OMPEnvFiles))
-	for rawName, rawPath := range cfg.OMPEnvFiles {
+	normalizedEnv := make(map[string]string, len(cfg.AgentEnv))
+	for rawName, rawValue := range cfg.AgentEnv {
 		name := strings.TrimSpace(rawName)
-		path := strings.TrimSpace(rawPath)
 		if !validEnvName(name) {
-			return fmt.Errorf("ompEnvFiles key %q is not a valid environment variable name", rawName)
+			return fmt.Errorf("agentEnv key %q is not a valid environment variable name", rawName)
 		}
-		if strings.HasPrefix(name, "OMP_SESSION_") {
-			return fmt.Errorf("ompEnvFiles key %q is reserved by agentd", name)
+		if _, exists := normalizedEnv[name]; exists {
+			return fmt.Errorf("agentEnv contains duplicate normalized key %q", name)
 		}
-		if _, exists := normalizedEnvFiles[name]; exists {
-			return fmt.Errorf("ompEnvFiles contains duplicate normalized key %q", name)
-		}
-		if path == "" {
-			return fmt.Errorf("ompEnvFiles[%q] must not be empty", name)
-		}
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(baseDir, path)
-		}
-		normalizedEnvFiles[name] = filepath.Clean(path)
+		normalizedEnv[name] = rawValue
 	}
-	cfg.OMPEnvFiles = normalizedEnvFiles
+	cfg.AgentEnv = normalizedEnv
+	cfg.CoordinatorTarget = strings.TrimSpace(cfg.CoordinatorTarget)
+	if cfg.CoordinatorTarget != "" && !validHerdrTarget(cfg.CoordinatorTarget) {
+		return errors.New("coordinatorTarget must be a simple Herdr agent, pane, tab, or terminal target")
+	}
 	if strings.TrimSpace(cfg.DataDir) == "" {
 		return errors.New("dataDir must not be empty")
 	}
@@ -162,8 +152,8 @@ func (cfg *Config) normalize(baseDir string) error {
 	}
 	return nil
 }
-func reservedOMPArg(arg string) bool {
-	for _, flag := range []string{"-p", "--print", "--session-dir", "--cwd", "--no-session", "--continue", "-c", "--resume", "-r", "--"} {
+func reservedAgentArg(arg string) bool {
+	for _, flag := range []string{"-p", "--print", "--mode", "--cwd", "--no-session", "--session", "--session-dir", "--session-id", "--fork-session", "--continue", "-c", "--resume", "-r", "--"} {
 		if arg == flag || strings.HasPrefix(arg, flag+"=") {
 			return true
 		}
@@ -179,6 +169,20 @@ func validEnvName(name string) bool {
 		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
 			return false
 		}
+	}
+	return true
+}
+
+func validHerdrTarget(target string) bool {
+	if len(target) == 0 || len(target) > 128 {
+		return false
+	}
+	for i := range target {
+		c := target[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == ':' {
+			continue
+		}
+		return false
 	}
 	return true
 }

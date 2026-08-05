@@ -1,11 +1,20 @@
 {
   "listen": "127.0.0.1:7337",
   "dataDir": "./data",
-  "ompBinary": "omp",
-  "ompArgs": [],
-  "ompEnvFiles": {},
   "herdrBinary": "herdr",
+  "agentArgs": [
+    "--config=/absolute/path/to/worker-config.yml",
+    "--append-system-prompt=/absolute/path/to/worker-profile.txt"
+  ],
+  "agentEnv": {
+    "LINEAR_API_KEY_FILE": "/absolute/path/to/linear-api-key"
+  },
+  "coordinatorTarget": "coordinator",
   "workspaces": [
-    { "id": "agentd", "name": "Agentd", "path": "." }
+    {
+      "id": "herdr:default:w7:mapping",
+      "name": "Agentd",
+      "path": "."
+    }
   ]
 }

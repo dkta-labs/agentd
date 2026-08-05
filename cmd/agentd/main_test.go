@@ -141,7 +141,7 @@ func TestRunCommandHelpListsJobOperations(t *testing.T) {
 	if code := run([]string{"help", "jobs"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
-	for _, expected := range []string{"create", "update", "start", "pause", "run", "stop", "runs"} {
+	for _, expected := range []string{"create", "update", "start", "pause", "run", "stop", "runs", "-goal KEY"} {
 		if !strings.Contains(stdout.String(), expected) {
 			t.Fatalf("jobs help does not contain %q:\n%s", expected, stdout.String())
 		}
@@ -158,8 +158,16 @@ func TestRunSubcommandHelpDoesNotLoadConfigOrContactDaemon(t *testing.T) {
 			args:     []string{"-config", missingConfig, "jobs", "list", "--help"},
 			expected: "jobs list",
 		},
+		"jobs nested help": {
+			args:     []string{"-config", missingConfig, "jobs", "help", "list"},
+			expected: "jobs list",
+		},
 		"workspace register": {
 			args:     []string{"-config", missingConfig, "workspaces", "register", "--help"},
+			expected: "workspaces register -id ID",
+		},
+		"workspace nested help": {
+			args:     []string{"-config", missingConfig, "workspaces", "help", "register"},
 			expected: "workspaces register -id ID",
 		},
 	} {
@@ -186,6 +194,15 @@ func TestHelpValueIsNotMisclassifiedAsHelpFlag(t *testing.T) {
 	}
 	if handled {
 		t.Fatalf("request value was handled as help: %q", output.String())
+	}
+}
+func TestParseAdminWriteIncludesGoalKey(t *testing.T) {
+	request, id, err := parseAdminWrite([]string{"jobs", "update", "-name", "job", "-workspace", "workspace", "-request", "do work", "-goal", "  goal-42  ", "job-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "job-id" || request.GoalKey != "  goal-42  " {
+		t.Fatalf("parsed request = %#v, id = %q", request, id)
 	}
 }
 
@@ -245,7 +262,6 @@ func writeCLIConfig(t *testing.T, listen string) string {
 	data, err := json.Marshal(config.Config{
 		Listen:      listen,
 		DataDir:     t.TempDir(),
-		OMPBinary:   "omp",
 		HerdrBinary: "herdr",
 	})
 	if err != nil {
@@ -277,7 +293,7 @@ func TestServeBindsBeforeMigratingDatabase(t *testing.T) {
 	}
 	defer listener.Close()
 	dataDir := filepath.Join(t.TempDir(), "data")
-	err = serve(config.Config{Listen: listener.Addr().String(), DataDir: dataDir, OMPBinary: "omp"})
+	err = serve(config.Config{Listen: listener.Addr().String(), DataDir: dataDir})
 	if err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("serve error = %v", err)
 	}
