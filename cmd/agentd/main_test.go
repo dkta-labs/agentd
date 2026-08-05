@@ -137,6 +137,7 @@ func TestAdminWaitActiveToTerminalIncludesLatestRun(t *testing.T) {
 func TestAdminWaitDueScheduledBeforeClaim(t *testing.T) {
 	var jobGets, runGets atomic.Int32
 	due := time.Now().UTC().Add(-time.Second)
+	future := time.Now().UTC().Add(time.Hour)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/jobs/job-due":
@@ -150,7 +151,9 @@ func TestAdminWaitDueScheduledBeforeClaim(t *testing.T) {
 					ID: "job-due", DesiredState: "running", State: "running", ActiveRunID: "run-due",
 				})
 			default:
-				_ = json.NewEncoder(w).Encode(store.Job{ID: "job-due", State: "paused"})
+				_ = json.NewEncoder(w).Encode(store.Job{
+					ID: "job-due", DesiredState: "running", State: "scheduled", NextRunAt: &future,
+				})
 			}
 		case "/jobs/job-due/runs":
 			runGets.Add(1)
@@ -175,8 +178,8 @@ func TestAdminWaitDueScheduledBeforeClaim(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.LatestRun == nil || result.LatestRun.ID != "run-due" {
-		t.Fatalf("latest run = %#v", result.LatestRun)
+	if result.Job.State != "scheduled" || result.Job.DesiredState != "running" || result.LatestRun == nil || result.LatestRun.ID != "run-due" {
+		t.Fatalf("wait result = %#v", result)
 	}
 	if jobGets.Load() < 4 {
 		t.Fatalf("job GET count = %d; want due observation, claim, and settlement", jobGets.Load())
