@@ -50,6 +50,51 @@ func claimManualRun(t *testing.T, db *DB, jobID, runID string, now time.Time) (J
 	return job, run
 }
 
+func TestRepeatedStartDoesNotAdvanceEnabledRecurringJob(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	job, err := db.CreateJob(ctx, Job{
+		ID:                "recurring-idempotent-start",
+		Name:              "Recurring idempotent start",
+		WorkspaceID:       "workspace",
+		Runner:            "test",
+		InvocationRequest: "do one thing",
+		CadenceSeconds:    600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartJob(ctx, job.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	claimedJob, run, claimed, err := db.ClaimNext(ctx, now, "recurring-run")
+	if err != nil || !claimed {
+		t.Fatalf("claim error=%v claimed=%t", err, claimed)
+	}
+	finishedAt := now.Add(time.Minute)
+	code := 0
+	scheduled, err := db.FinishRun(ctx, claimedJob.ID, run.ID, "completed", &code, "", "", "", "", finishedAt, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scheduled.NextRunAt == nil {
+		t.Fatalf("completed job has no next run: %#v", scheduled)
+	}
+	wantNextRunAt := *scheduled.NextRunAt
+	restarted, err := db.StartJob(ctx, job.ID, finishedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.State != "scheduled" || restarted.DesiredState != "running" ||
+		restarted.NextRunAt == nil || !restarted.NextRunAt.Equal(wantNextRunAt) {
+		t.Fatalf("repeated start changed schedule: %#v; want next run %s", restarted, wantNextRunAt)
+	}
+	if _, _, claimed, err := db.ClaimNext(ctx, finishedAt.Add(time.Minute), "too-early-run"); err != nil || claimed {
+		t.Fatalf("early claim error=%v claimed=%t", err, claimed)
+	}
+}
+
 func TestManualRunPersistsEvidenceAndSuccessfulExit(t *testing.T) {
 	db := openTestDB(t)
 	job := createManualJob(t, db, "job-one")

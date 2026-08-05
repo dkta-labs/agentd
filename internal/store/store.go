@@ -449,7 +449,7 @@ func (s *DB) StartJob(ctx context.Context, id string, now time.Time) (Job, error
 		return Job{}, ErrStopping
 	}
 	now = now.UTC()
-	_, e = s.db.ExecContext(ctx, `UPDATE jobs SET desired_state='running',state=CASE WHEN state IN ('starting','running') THEN state ELSE 'scheduled' END,next_run_at=CASE WHEN state IN ('starting','running') THEN next_run_at ELSE ? END,last_error='',updated_at=? WHERE id=?`, encodeTime(now), encodeTime(now), id)
+	_, e = s.db.ExecContext(ctx, `UPDATE jobs SET desired_state='running',state=CASE WHEN state IN ('starting','running') THEN state ELSE 'scheduled' END,next_run_at=CASE WHEN state IN ('starting','running') THEN next_run_at ELSE ? END,last_error='',updated_at=? WHERE id=? AND desired_state!='running'`, encodeTime(now), encodeTime(now), id)
 	if e != nil {
 		return Job{}, e
 	}
