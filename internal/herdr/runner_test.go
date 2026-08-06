@@ -114,6 +114,7 @@ func TestRunnerDispatchesInteractiveOwnerAndReturnsBeforeCompletion(t *testing.T
 	logText := string(logBytes)
 	for _, fragment := range []string{
 		"tab\tcreate",
+		"--label\tgoal-nightly\t--no-focus",
 		"agent\tstart",
 		"agent\tprompt",
 		"perform bounded work",
@@ -374,6 +375,54 @@ func TestOwnerFingerprintSeparatesWorkspaceIdentityAndPath(t *testing.T) {
 	changedID.WorkspaceID = "herdr:default:w8:mapping"
 	if ownerName(ownerFingerprint(job)) == ownerName(ownerFingerprint(changedID)) {
 		t.Fatal("changed workspace id reused owner")
+	}
+}
+
+func TestTabLabelUsesHumanGoalAndWorkspaceMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		job  runner.Job
+		want string
+	}{
+		{
+			name: "repository role",
+			job:  runner.Job{GoalKey: "agent-tools/repository-scout"},
+			want: "agent-tools · scout",
+		},
+		{
+			name: "single segment goal",
+			job:  runner.Job{GoalKey: "goal-nightly"},
+			want: "goal-nightly",
+		},
+		{
+			name: "control characters",
+			job:  runner.Job{GoalKey: "\x1bDKT-75/portfolio-triage\x7f"},
+			want: "DKT-75 · portfolio-triage",
+		},
+		{
+			name: "workspace fallback",
+			job:  runner.Job{WorkspacePath: "/tmp/tavernbench-server"},
+			want: "Agentd · tavernbench-server",
+		},
+		{
+			name: "empty fallback",
+			job:  runner.Job{},
+			want: "Agentd worker",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := tabLabel(test.job); got != test.want {
+				t.Fatalf("tabLabel() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTabLabelIsBounded(t *testing.T) {
+	got := tabLabel(runner.Job{GoalKey: "project/" + strings.Repeat("x", 100)})
+	if len([]rune(got)) != 80 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("tabLabel() = %q (%d runes), want 80 runes ending in ellipsis", got, len([]rune(got)))
 	}
 }
 
