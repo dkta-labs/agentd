@@ -39,7 +39,7 @@ agentd -config agentd.json workspaces register -id project -name "Project" -path
 agentd -config agentd.json workspaces list
 ```
 
-Runnable OMP jobs require a Herdr-mapped workspace ID. Each job has a stable owner target named `agentd-<job-hash>`. Recurring runs reuse the same idle OMP session, retaining its context and tools. `jobs get` and `jobs list` expose that target as `ownerTarget` while a run is active. The same owner is visible and interactive through `herdr agent list|get|read|focus|attach|prompt`.
+Runnable OMP jobs require a Herdr-mapped workspace ID. Each job has a stable opaque owner target named `agentd-<job-hash>` for lifecycle identity and session reuse. Its Herdr tab uses the human goal key or workspace name as a separate presentation label. Recurring runs reuse the same idle OMP session, retaining its context and tools. `jobs get` and `jobs list` expose the opaque target as `ownerTarget` while a run is active. The same owner is visible and interactive through `herdr agent list|get|read|focus|attach|prompt`.
 
 When creating a job, `-goal <goal-key>` is optional collision/visibility metadata. A goal key identifies the work being dispatched; it is not an approval gate. Concurrent goals must use distinct worktrees and workspace paths so their work cannot collide. A worker stays within its assigned goal's worktree, branch, issue, and PR.
 

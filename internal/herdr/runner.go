@@ -269,7 +269,7 @@ func (r Runner) Attach(ctx context.Context, _ runner.Job, owner string) (runner.
 }
 
 func (r Runner) create(ctx context.Context, workspaceID, owner string, job runner.Job) (agentInfo, error) {
-	args := []string{"tab", "create", "--workspace", workspaceID, "--cwd", job.WorkspacePath, "--label", owner, "--no-focus"}
+	args := []string{"tab", "create", "--workspace", workspaceID, "--cwd", job.WorkspacePath, "--label", tabLabel(job), "--no-focus"}
 	names := make([]string, 0, len(r.AgentEnv))
 	for name := range r.AgentEnv {
 		names = append(names, name)
@@ -501,6 +501,35 @@ func ownerFingerprint(job runner.Job) string {
 		job.WorkspaceID,
 		filepath.Clean(job.WorkspacePath),
 	}, "\x00")
+}
+
+func tabLabel(job runner.Job) string {
+	goalKey := strings.TrimSpace(sanitizeTerminal(job.GoalKey))
+	if goalKey != "" {
+		parts := strings.Split(goalKey, "/")
+		project := strings.TrimSpace(parts[0])
+		role := strings.TrimSpace(parts[len(parts)-1])
+		role = strings.TrimPrefix(role, "repository-")
+		if len(parts) > 1 && project != "" && role != "" {
+			return boundedTabLabel(project + " · " + role)
+		}
+		return boundedTabLabel(goalKey)
+	}
+
+	workspace := strings.TrimSpace(sanitizeTerminal(filepath.Base(filepath.Clean(job.WorkspacePath))))
+	if workspace == "" || workspace == "." || workspace == string(filepath.Separator) {
+		return "Agentd worker"
+	}
+	return boundedTabLabel("Agentd · " + workspace)
+}
+
+func boundedTabLabel(label string) string {
+	const maxRunes = 80
+	runes := []rune(label)
+	if len(runes) <= maxRunes {
+		return label
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 func ownershipPrompt(job runner.Job, owner, coordinator string, binaries ...string) string {
