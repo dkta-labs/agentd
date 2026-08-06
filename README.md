@@ -75,3 +75,43 @@ agentd -config agentd.json jobs wait <job-id> --timeout 30m
 `agentd top` is the read-only terminal visualization for the configured daemon. It refreshes a lifecycle-sorted jobs table with active run, Herdr owner, elapsed time, last/next run, and bounded failure detail. It performs only `GET` requests, fetches run details only for active jobs, and does not inspect transcripts or guess semantic percent complete. Piped output renders one snapshot automatically.
 
 The loopback HTTP API exposes `GET /health`, `GET/POST /workspaces`, job create/update/list/get, `POST /jobs/{id}/start`, `/pause`, `/run`, `/stop`, and `GET /jobs/{id}/runs`. `/mcp` implements MCP Streamable HTTP JSON-RPC for nine namespaced tools exposing the job operations; browser requests with non-loopback origins are rejected.
+
+## GitHub webhook dispatch
+
+`agentd-github-hook` is a separate provider adapter; Agentd core remains a
+provider-neutral loopback scheduler. The adapter verifies signed GitHub
+deliveries, matches them to existing job IDs, and calls the existing
+`POST /jobs/{id}/run` endpoint.
+
+```json
+{
+  "listen": "127.0.0.1:7338",
+  "agentdUrl": "http://127.0.0.1:7337",
+  "secretFile": "./github-hook.secret",
+  "dataDir": "./github-hook-data",
+  "rules": [
+    {
+      "id": "agentd-pr-merged",
+      "event": "pull_request",
+      "action": "closed",
+      "repository": "dkta-labs/agentd",
+      "merged": true,
+      "jobId": "job_existing"
+    }
+  ]
+}
+```
+
+```sh
+chmod 600 github-hook.secret
+agentd-github-hook -config github-hook.json
+```
+
+GitHub sends events to `POST /github` with `X-GitHub-Event`,
+`X-GitHub-Delivery`, and `X-Hub-Signature-256`. The adapter binds only to
+loopback, accepts at most one MiB, stores no payloads, and durably deduplicates
+successful delivery/rule pairs in its own SQLite file. An invalid signature is
+rejected. Unmatched events are acknowledged without dispatch. If Agentd cannot
+accept a run, the adapter releases the receipt and returns `503` with
+`Retry-After` so the sender can retry. Public ingress, TLS, and tunnel
+configuration remain the responsibility of the existing host edge.
