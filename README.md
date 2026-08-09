@@ -1,10 +1,14 @@
 # agentd
 
-`agentd` is a small local daemon for scheduled agent jobs. It persists job definitions and run evidence in SQLite, prevents overlap for one job, dispatches each run to a normal interactive OMP agent owned by Herdr, and observes that owner in the background.
+`agentd` is a local generic job runner for scheduled processes. It persists job definitions and run evidence in SQLite, prevents overlap for one job, and owns only bounded launch, wait, stop, and restart-recovery behavior. It does not own portfolio coordination, operator-workspace hosting, or product workflow policy.
 
-Agentd does not launch OMP itself. For a configured Herdr workspace mapping (`herdr:<server>:<workspace>:<mapping>`), it creates or reuses a real Herdr tab, starts OMP through `herdr agent start`, submits the bounded request, records the owner target, then waits for the interactive agent to settle. The coordinator is free immediately after dispatch. Agentd restart detaches and reattaches its watcher without stopping a healthy worker.
+**Status:** Agent D's user service is disabled and its durable jobs are paused under [DKT-167](https://linear.app/dkta-labs/issue/DKT-167/quiesce-agent-d-and-adopt-cmux-tui-workflow). The retained implementation is Herdr-coupled source, not an active runtime authority. Reactivation or replacement requires a separate accepted issue and current integration proof.
 
-## Configuration
+## Retained implementation contract
+
+The checked-in runner integration uses a configured Herdr workspace mapping (`herdr:<server>:<workspace>:<mapping>`). It creates or reuses a Herdr tab, starts OMP through `herdr agent start`, submits the bounded request, records the owner target, and waits for the interactive agent to settle. Agentd restart detaches and reattaches its watcher without stopping a healthy worker. The optional coordinator target is a notification endpoint, not planning or approval authority. These fields document source compatibility; they do not grant an active portfolio role.
+
+### Configuration
 
 ```json
 {
