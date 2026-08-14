@@ -1,0 +1,30 @@
+when:
+  - event: [pull_request, push]
+    branch: main
+
+labels:
+  location: daimon
+
+clone:
+  git:
+    image: docker.io/woodpeckerci/plugin-git:2.9.2@sha256:a36586dfe77e9c5d9b5bff3ad37f18158eb12036aa9e9908e2e813ee6029573e
+    settings:
+      depth: 50
+
+steps:
+  format:
+    image: docker.io/library/golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb65df3556
+    commands:
+      - test -z "$(gofmt -l .)"
+  vet:
+    image: docker.io/library/golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb65df3556
+    commands:
+      - go vet ./...
+  test:
+    image: docker.io/library/golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb65df3556
+    commands:
+      - go test ./...
+  build:
+    image: docker.io/library/golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb65df3556
+    commands:
+      - go build ./...
