@@ -24,3 +24,4 @@ Runner integrations must remain replaceable. Keep the core seam limited to lifec
 Canonical rationale: `~/grimoire/decisions/2026-07-30-agentd-scheduled-agent-supervisor.html`.
 
 Current portfolio status: [DKT-167](https://linear.app/dkta-labs/issue/DKT-167/quiesce-agent-d-and-adopt-cmux-tui-workflow). Current repository cleanup: [GitHub issue #14](https://github.com/dkta-labs/agentd/issues/14). Historical implementation evidence: [DKT-139](https://linear.app/dkta-labs/issue/DKT-139/dispatch-agentd-work-as-detached-interactive-herdr-agents) and [DKT-67](https://linear.app/dkta-labs/issue/DKT-67/cut-agentd-over-to-the-minimal-scheduled-agent-supervisor).
+do not use narrative language in UI copy unless explicitly requested
